@@ -1,123 +1,155 @@
--- ============================================================
--- Phase 2 数据库迁移脚本（修复版）
--- 执行前请先备份！建议在 1Panel 数据库管理中执行。
--- ============================================================
+"""
+tron_listener.py — TronGrid USDT(TRC20) 监听器
+- 监控波场链上 USDT 转账
+- 自动核销订单并通知用户
+"""
 
--- ────────────────────────────────────────────────────────────
--- 1. products 表补全字段
--- ────────────────────────────────────────────────────────────
-ALTER TABLE products
-    MODIFY COLUMN last_sync_price DECIMAL(20, 6) DEFAULT NULL COMMENT '上游同步价格',
-    ADD COLUMN IF NOT EXISTS price DECIMAL(20, 6) DEFAULT NULL COMMENT '人工设置的 USDT 售价';
+import asyncio
+import logging
+import time
+from decimal import Decimal, ROUND_DOWN
+import aiohttp
 
+# 导入项目内部模块
+from config import BOT_TOKEN, USDT_WALLET, TRONGRID_API_KEY, TRON_POLL_INTERVAL
+from database import (
+    get_db_pool,
+    find_pending_order_by_amount,
+    get_listener_cursor_ms,
+    set_listener_cursor_ms,
+    get_processed_tx_hashes,
+    tx_hash_already_used,
+    record_tx_hash,
+    get_pending_order_by_id
+)
+from aiogram import Bot
 
--- ────────────────────────────────────────────────────────────
--- 2. 订单主表
---    关键设计：
---      final_amount  DECIMAL(20,6) UNIQUE  —— 唯一索引防金额冲突
---      expires_at    DATETIME              —— 30 分钟后过期释放坑位
---      tx_hash       VARCHAR(128)          —— 链上哈希，核销后写入
--- ────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS recharge_orders (
-    id            BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    user_id       BIGINT NOT NULL                         COMMENT '购买者 TG ID',
-    product_id    INT UNSIGNED DEFAULT NULL               COMMENT '商品 ID（充值订单为 NULL）',
-    order_type    ENUM('purchase','recharge') NOT NULL DEFAULT 'purchase'
-                  COMMENT 'purchase=购买商品 recharge=余额充值',
-    amount        DECIMAL(20, 6) NOT NULL                 COMMENT '商品基础价格',
-    final_amount  DECIMAL(20, 6) NOT NULL                 COMMENT '含随机小数的实付金额（唯一）',
-    tx_hash       VARCHAR(128)   DEFAULT NULL             COMMENT '链上交易哈希',
-    status        ENUM('pending','paid','fulfilled','expired','cancelled')
-                  NOT NULL DEFAULT 'pending'              COMMENT '订单状态',
-    paid_at       DATETIME       DEFAULT NULL             COMMENT '支付确认时间',
-    expires_at    DATETIME       NOT NULL                 COMMENT '订单过期时间',
-    created_at    DATETIME       NOT NULL DEFAULT CURRENT_TIMESTAMP,
+# 日志配置
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("TronListener")
 
-    -- ⚠️  UNIQUE 约束核心：同一时刻只能有一个 pending 占用某个金额
-    --    注意：expired/cancelled 的记录不占用此索引（MySQL UNIQUE 对 NULL 无限制）
-    --    但我们的 final_amount 不为 NULL，所以只依赖过期清理来释放坑位
-    UNIQUE KEY uk_final_amount (final_amount),
+USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+TRONGRID_API = "https://api.trongrid.io"
+FETCH_LIMIT = 200
+MIN_POLL_INTERVAL = 2
+LISTENER_OVERLAP_MS = 60000  # 1分钟重叠，防止漏单
+LISTENER_DEFAULT_LOOKBACK_MS = 604800000  # 首次扫描回溯7天
 
-    INDEX idx_status_expires (status, expires_at),
-    INDEX idx_user_id        (user_id),
-    INDEX idx_created_at     (created_at),
-    INDEX idx_tx_hash        (tx_hash)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='充值/购买订单表';
+def sun_to_usdt(sun_value) -> Decimal:
+    return (Decimal(str(sun_value)) / Decimal("1000000")).quantize(
+        Decimal("0.000001"), rounding=ROUND_DOWN
+    )
 
+def _get_tx_timestamp(tx: dict) -> int:
+    for key in ("block_timestamp", "blockTimestamp"):
+        val = tx.get(key)
+        if val: return int(val)
+    return int(time.time() * 1000)
 
--- ────────────────────────────────────────────────────────────
--- 3. 链上交易记录（去重 + 审计）
---    tx_hash UNIQUE 保证同一笔链上交易绝不重复核销
--- ────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS tx_records (
-    id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    tx_hash    VARCHAR(128) NOT NULL                     COMMENT '链上交易哈希',
-    order_id   BIGINT       DEFAULT NULL                 COMMENT '关联订单（NULL=未匹配）',
-    amount     DECIMAL(20, 6) NOT NULL                   COMMENT '转账 USDT 金额',
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+class TronListener:
+    def __init__(self, wallet, db_pool, bot, api_key="", interval=15):
+        self.wallet = wallet
+        self.db_pool = db_pool
+        self.bot = bot
+        self.api_key = api_key
+        self.poll_interval = max(interval, MIN_POLL_INTERVAL)
+        self._seen_tx = set()
+        self._min_ts = 0
 
-    UNIQUE KEY uk_tx_hash   (tx_hash),
-    INDEX      idx_order_id (order_id),
-    INDEX      idx_created  (created_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='链上 TRC20 交易记录';
+    async def start(self):
+        logger.info(f"🔗 监听启动 | 地址: {self.wallet} | 间隔: {self.poll_interval}s")
+        # 1. 加载已处理的 Hash
+        hashes = await get_processed_tx_hashes(self.db_pool)
+        self._seen_tx = set(hashes)
+        
+        # 2. 初始化扫描游标
+        stored = await get_listener_cursor_ms(self.db_pool)
+        if stored > 0:
+            self._min_ts = stored - LISTENER_OVERLAP_MS
+        else:
+            self._min_ts = int(time.time() * 1000) - LISTENER_DEFAULT_LOOKBACK_MS
+            logger.info("首次运行，开始回溯扫描...")
 
+        while True:
+            try:
+                await self._poll()
+            except Exception as e:
+                logger.error(f"轮询异常: {e}", exc_info=True)
+            await asyncio.sleep(self.poll_interval)
 
--- ────────────────────────────────────────────────────────────
--- 4. 发货记录表
--- ────────────────────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS delivery_records (
-    id         BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    order_id   BIGINT NOT NULL                           COMMENT '关联订单',
-    product_id INT UNSIGNED NOT NULL                     COMMENT '关联商品',
-    status     ENUM('success','failed') NOT NULL DEFAULT 'failed',
-    content    MEDIUMTEXT               DEFAULT NULL     COMMENT '提货内容原始数据（卡密等）',
-    error_msg  VARCHAR(512)             DEFAULT ''       COMMENT '失败原因',
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    async def _poll(self):
+        url = f"{TRONGRID_API}/v1/accounts/{self.wallet}/transactions/trc20"
+        params = {
+            "contract_address": USDT_CONTRACT,
+            "only_to": "true",
+            "limit": FETCH_LIMIT,
+            "order_by": "block_timestamp,asc",
+            "min_timestamp": str(max(0, self._min_ts))
+        }
+        headers = {"TRON-PRO-API-KEY": self.api_key} if self.api_key else {}
 
-    UNIQUE KEY uk_order_id (order_id),
-    INDEX      idx_status  (status)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='发货记录';
+        async with aiohttp.ClientSession(headers=headers) as session:
+            async with session.get(url, params=params) as resp:
+                if resp.status != 200:
+                    logger.error(f"TronGrid 错误: {resp.status}")
+                    return
+                data = await resp.json()
+                
+                max_ts = self._min_ts
+                for tx in data.get("data", []):
+                    tx_hash = tx.get("transaction_id")
+                    ts = _get_tx_timestamp(tx)
+                    max_ts = max(max_ts, ts)
 
+                    if tx_hash in self._seen_tx: continue
+                    
+                    amount = sun_to_usdt(tx.get("value", 0))
+                    await self._handle_transfer(tx_hash, amount)
+                    self._seen_tx.add(tx_hash)
 
--- ────────────────────────────────────────────────────────────
--- 5. system_config 默认行（幂等，可重复执行）
--- ────────────────────────────────────────────────────────────
-INSERT IGNORE INTO system_config (config_key, config_value) VALUES
-    ('shop_url',               ''),
-    ('app_id',                 ''),
-    ('app_key',                ''),
-    ('customer_service',       ''),
-    ('tron_listener_min_ts',   '0');
+                if max_ts > self._min_ts:
+                    self._min_ts = max_ts + 1
+                    await set_listener_cursor_ms(self.db_pool, max_ts)
 
+    async def _handle_transfer(self, tx_hash, amount):
+        # 延迟导入防止循环引用
+        from settlement import atomic_mark_paid_and_record, atomic_settle_recharge
+        from fulfillment import fulfill_purchase_after_paid, notify_payment_received, notify_recharge_completed
 
--- ────────────────────────────────────────────────────────────
--- 6. 索引补丁（如果 recharge_orders 已存在旧版本，补加字段/索引）
--- ────────────────────────────────────────────────────────────
--- 补 order_type / 可空 product_id
-ALTER TABLE recharge_orders
-    ADD COLUMN IF NOT EXISTS order_type ENUM('purchase','recharge') NOT NULL DEFAULT 'purchase'
-        COMMENT 'purchase=购买 recharge=充值',
-    MODIFY COLUMN product_id INT UNSIGNED NULL COMMENT '商品 ID（充值为 NULL）';
+        order = await find_pending_order_by_amount(self.db_pool, amount)
+        if not order:
+            logger.info(f"忽略未匹配转账: {amount} USDT (Hash: {tx_hash})")
+            await record_tx_hash(self.db_pool, tx_hash, None, amount)
+            return
 
--- 补 expires_at 字段
-ALTER TABLE recharge_orders
-    ADD COLUMN IF NOT EXISTS expires_at DATETIME NOT NULL DEFAULT '2099-01-01 00:00:00'
-        COMMENT '订单过期时间',
-    ADD COLUMN IF NOT EXISTS tx_hash    VARCHAR(128) DEFAULT NULL
-        COMMENT '链上交易哈希',
-    ADD COLUMN IF NOT EXISTS paid_at    DATETIME DEFAULT NULL
-        COMMENT '支付确认时间',
-    MODIFY COLUMN final_amount DECIMAL(20, 6) NOT NULL,
-    MODIFY COLUMN amount       DECIMAL(20, 6) NOT NULL;
+        order_id = order['id']
+        logger.info(f"✅ 匹配订单 #{order_id} | 金额: {amount}")
 
--- 补 UNIQUE 索引（如已存在会报 Duplicate key name，忽略即可）
-ALTER TABLE recharge_orders
-    ADD UNIQUE INDEX IF NOT EXISTS uk_final_amount (final_amount);
+        if order.get('order_type') == 'recharge':
+            if await atomic_settle_recharge(self.db_pool, order_id, order['user_id'], order['amount'], tx_hash, amount):
+                await notify_recharge_completed(self.bot, self.db_pool, order['user_id'], order_id, order['amount'])
+        else:
+            if await atomic_mark_paid_and_record(self.db_pool, order_id, tx_hash, amount):
+                await notify_payment_received(self.bot, order['user_id'], order_id, amount, tx_hash)
+                await fulfill_purchase_after_paid(self.db_pool, self.bot, order_id, order['user_id'], order['product_id'], tx_hash, amount)
 
--- 补联合索引（加速监听器查询）
-ALTER TABLE recharge_orders
-    ADD INDEX IF NOT EXISTS idx_status_expires (status, expires_at);
+async def main():
+    pool = await get_db_pool()
+    bot = Bot(token=BOT_TOKEN)
+    listener = TronListener(
+        wallet=USDT_WALLET,
+        db_pool=pool,
+        bot=bot,
+        api_key=TRONGRID_API_KEY,
+        interval=int(TRON_POLL_INTERVAL)
+    )
+    await listener.start()
 
--- 补 tx_hash 索引（去重与审计查询）
-ALTER TABLE recharge_orders
-    ADD INDEX IF NOT EXISTS idx_tx_hash (tx_hash);
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
