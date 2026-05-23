@@ -229,11 +229,56 @@ async def get_order_by_id(pool, order_id: int) -> dict | None:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(
                 """
-                SELECT id, user_id, product_id, order_type, amount, final_amount, status
+                SELECT id, user_id, product_id, order_type, amount, final_amount,
+                       status, tx_hash, expires_at, paid_at
                 FROM recharge_orders WHERE id = %s
                 """,
                 (order_id,),
             )
+            return await cur.fetchone()
+
+
+async def tx_hash_already_used(pool, tx_hash: str) -> bool:
+    """链上哈希是否已在 tx_records 或订单表中出现过。"""
+    if not tx_hash:
+        return False
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT 1 FROM tx_records WHERE tx_hash = %s LIMIT 1", (tx_hash,)
+            )
+            if await cur.fetchone():
+                return True
+            await cur.execute(
+                """
+                SELECT 1 FROM recharge_orders
+                WHERE tx_hash = %s AND tx_hash IS NOT NULL AND tx_hash != ''
+                LIMIT 1
+                """,
+                (tx_hash,),
+            )
+            return await cur.fetchone() is not None
+
+
+async def get_pending_order_by_id(
+    pool, order_id: int, usdt_amount: Decimal | None = None
+) -> dict | None:
+    """核销前二次确认：订单仍为 pending、未过期、尚未写入 tx_hash。"""
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            sql = """
+                SELECT id, user_id, product_id, order_type, amount, final_amount, tx_hash
+                FROM recharge_orders
+                WHERE id = %s
+                  AND status = 'pending'
+                  AND expires_at > NOW()
+                  AND (tx_hash IS NULL OR tx_hash = '')
+            """
+            params: list = [order_id]
+            if usdt_amount is not None:
+                sql += " AND ABS(final_amount - %s) < 0.000001"
+                params.append(str(normalize_amount(usdt_amount)))
+            await cur.execute(sql, params)
             return await cur.fetchone()
 
 
@@ -258,10 +303,11 @@ async def find_pending_order_by_amount(pool, usdt_amount: Decimal) -> dict | Non
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(
                 """
-                SELECT id, user_id, product_id, order_type, amount, final_amount
+                SELECT id, user_id, product_id, order_type, amount, final_amount, tx_hash
                 FROM recharge_orders
                 WHERE status = 'pending'
                   AND expires_at > NOW()
+                  AND (tx_hash IS NULL OR tx_hash = '')
                   AND ABS(final_amount - %s) < 0.000001
                 ORDER BY created_at ASC
                 LIMIT 1
@@ -273,16 +319,22 @@ async def find_pending_order_by_amount(pool, usdt_amount: Decimal) -> dict | Non
 
 async def mark_order_paid(pool, order_id: int, tx_hash: str) -> bool:
     """
-    乐观锁更新：仅当 status='pending' 时才成功，
-    防止监听器在同一笔 tx 上二次触发。
+    乐观锁核销：仅 pending + 未过期 + 尚未绑定 tx_hash 的订单可更新。
+    同时将链上哈希写入 recharge_orders.tx_hash。
     """
+    if not tx_hash or await tx_hash_already_used(pool, tx_hash):
+        return False
+
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
                 """
                 UPDATE recharge_orders
                 SET status = 'paid', tx_hash = %s, paid_at = NOW()
-                WHERE id = %s AND status = 'pending'
+                WHERE id = %s
+                  AND status = 'pending'
+                  AND expires_at > NOW()
+                  AND (tx_hash IS NULL OR tx_hash = '')
                 """,
                 (tx_hash, order_id),
             )
@@ -335,17 +387,25 @@ async def expire_stale_orders(pool) -> list[Decimal]:
 
 async def get_processed_tx_hashes(pool) -> list[str]:
     """
-    启动时加载近 7 天的已处理 tx_hash 到内存，
-    防止重启后重复核销，同时避免全表扫描。
+    启动时加载近 7 天已处理 tx_hash（tx_records + 订单表），防重启重复核销。
     """
+    hashes: set[str] = set()
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
                 "SELECT tx_hash FROM tx_records "
                 "WHERE created_at >= NOW() - INTERVAL 7 DAY"
             )
-            rows = await cur.fetchall()
-            return [r[0] for r in rows]
+            hashes.update(r[0] for r in await cur.fetchall() if r[0])
+            await cur.execute(
+                """
+                SELECT tx_hash FROM recharge_orders
+                WHERE tx_hash IS NOT NULL AND tx_hash != ''
+                  AND paid_at >= NOW() - INTERVAL 7 DAY
+                """
+            )
+            hashes.update(r[0] for r in await cur.fetchall() if r[0])
+    return list(hashes)
 
 
 async def record_tx_hash(

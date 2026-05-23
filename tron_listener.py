@@ -181,63 +181,106 @@ class TronListener:
         """
         from database import (
             find_pending_order_by_amount,
+            get_pending_order_by_id,
             mark_order_paid,
             record_tx_hash,
+            tx_hash_already_used,
         )
         from fulfillment import fulfill_order
 
-        # ── 1. 匹配订单 ──────────────────────────────────────────────
+        # ── 0. 链上哈希去重（内存 + DB 双检）──────────────────────────
+        if await tx_hash_already_used(self.db_pool, tx_hash):
+            logger.info("跳过已处理 tx: %s", tx_hash)
+            return
+
+        # ── 1. 匹配：仅 pending + 未过期 + 无 tx_hash ─────────────────
         order = await find_pending_order_by_amount(self.db_pool, usdt_amount)
         if not order:
             logger.info(
-                "⚠️  %s USDT 未匹配到任何有效订单（可能已过期或金额有误）",
+                "⚠️  %s USDT 未匹配到有效 pending 订单（过期/金额有误/已核销）",
                 usdt_amount,
             )
             await record_tx_hash(self.db_pool, tx_hash, None, usdt_amount)
             return
 
-        order_id    = order["id"]
-        user_tg_id  = order["user_id"]
-        product_id  = order.get("product_id")
-        order_type  = order.get("order_type", "purchase")
+        order_id = order["id"]
+
+        # ── 1b. 核销前二次确认（防轮询窗口内状态变化）──────────────────
+        order = await get_pending_order_by_id(
+            self.db_pool, order_id, usdt_amount
+        )
+        if not order:
+            logger.warning(
+                "订单 #%d 二次校验失败，放弃核销 tx=%s", order_id, tx_hash
+            )
+            await record_tx_hash(self.db_pool, tx_hash, None, usdt_amount)
+            return
+
+        user_tg_id = order["user_id"]
+        product_id = order.get("product_id")
+        order_type = order.get("order_type", "purchase")
         base_amount = order["amount"]
         final_amount = order["final_amount"]
         logger.info(
-            "✅ 匹配成功 | 订单 #%d | 用户 %d | 类型 %s",
-            order_id, user_tg_id, order_type,
+            "✅ 匹配成功 | 订单 #%d | 用户 %d | 类型 %s | tx=%s",
+            order_id, user_tg_id, order_type, tx_hash,
         )
 
-        # ── 2. 乐观锁标记支付（幂等，防二次触发） ────────────────────
+        # ── 2. 标记 paid 并写入订单表 tx_hash ─────────────────────────
         updated = await mark_order_paid(self.db_pool, order_id, tx_hash)
         if not updated:
-            logger.warning("订单 #%d 已被处理，跳过（tx=%s）", order_id, tx_hash)
+            logger.warning(
+                "订单 #%d 核销失败（非 pending/已过期/tx 重复）tx=%s",
+                order_id, tx_hash,
+            )
+            await record_tx_hash(self.db_pool, tx_hash, None, usdt_amount)
             return
 
-        # ── 3. 持久化 tx_hash ────────────────────────────────────────
+        # ── 3. 审计表记录 ─────────────────────────────────────────────
         await record_tx_hash(self.db_pool, tx_hash, order_id, usdt_amount)
 
-        # ── 4. 通知用户：收款确认 ────────────────────────────────────
+        # ── 4. 通知用户：收款确认 ─────────────────────────────────────
         try:
             await self.bot.send_message(
                 user_tg_id,
                 f"✅ *收款已确认！*\n\n"
                 f"📋 订单号：`#{order_id}`\n"
-                f"💰 金额：`{usdt_amount} USDT`\n\n"
-                f"⏳ 正在为您提货，请稍候...",
+                f"💰 金额：`{usdt_amount} USDT`\n"
+                f"🔗 Tx：`{tx_hash}`\n\n"
+                f"⏳ 正在为您处理，请稍候...",
                 parse_mode="Markdown",
             )
         except Exception as e:
             logger.error("发送确认消息失败 [user %d]: %s", user_tg_id, e)
 
-        # ── 5. 收尾（充值入账 / 购买提货，并释放 Redis 锁）────────────
-        await fulfill_order(
-            db_pool=self.db_pool,
-            bot=self.bot,
-            order_id=order_id,
-            user_tg_id=user_tg_id,
-            product_id=product_id,
-            order_type=order_type,
-            base_amount=base_amount,
-            redis_client=self.redis,
-            final_amount=final_amount,
-        )
+        # ── 5. 收尾（异常由 fulfillment 通知用户 + 管理员）────────────
+        try:
+            await fulfill_order(
+                db_pool=self.db_pool,
+                bot=self.bot,
+                order_id=order_id,
+                user_tg_id=user_tg_id,
+                product_id=product_id,
+                order_type=order_type,
+                base_amount=base_amount,
+                redis_client=self.redis,
+                final_amount=final_amount,
+                tx_hash=tx_hash,
+            )
+        except Exception as e:
+            logger.error(
+                "订单 #%d 收尾异常 tx=%s: %s", order_id, tx_hash, e, exc_info=True
+            )
+            from notifications import format_fulfillment_alert, notify_admin
+
+            await notify_admin(
+                self.bot,
+                format_fulfillment_alert(
+                    order_id=order_id,
+                    user_tg_id=user_tg_id,
+                    order_type=order_type,
+                    reason=f"监听器收尾异常: {e}",
+                    tx_hash=tx_hash,
+                    final_amount=final_amount,
+                ),
+            )

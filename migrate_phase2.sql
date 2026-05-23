@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS recharge_orders (
 
     INDEX idx_status_expires (status, expires_at),
     INDEX idx_user_id        (user_id),
-    INDEX idx_created_at     (created_at)
+    INDEX idx_created_at     (created_at),
+    INDEX idx_tx_hash        (tx_hash)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='充值/购买订单表';
 
 
@@ -115,3 +116,7 @@ ALTER TABLE recharge_orders
 -- 补联合索引（加速监听器查询）
 ALTER TABLE recharge_orders
     ADD INDEX IF NOT EXISTS idx_status_expires (status, expires_at);
+
+-- 补 tx_hash 索引（去重与审计查询）
+ALTER TABLE recharge_orders
+    ADD INDEX IF NOT EXISTS idx_tx_hash (tx_hash);
