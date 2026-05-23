@@ -1,41 +1,53 @@
 """
-tron_listener.py — 修复版
-修复点：
-  1. 轮询间隔 >= 2s，防 TronGrid 限速（免费档 3 req/s）
-  2. 每次拉取 50 条记录（非 1 条），防短时多笔漏单
-  3. 金额转换全程 Decimal + 字符串，零浮点精度丢失
-  4. 只匹配未过期 pending 订单（由 DB 层保证）
-  5. 已处理 tx 写入内存 set + DB，重启不重复核销
-  6. API 限速时指数退避，不无限快速重试
+tron_listener.py — TronGrid USDT(TRC20) 监听器
+- 从 DB 读取/更新扫描游标，重启不漏单
+- 核销走 settlement 事务
 """
 
 import asyncio
 import logging
+import time
+
 import aiohttp
 from decimal import Decimal, ROUND_DOWN
 
+from database import (
+    LISTENER_DEFAULT_LOOKBACK_MS,
+    LISTENER_OVERLAP_MS,
+    find_pending_order_by_amount,
+    get_listener_cursor_ms,
+    get_pending_order_by_id,
+    get_processed_tx_hashes,
+    record_tx_hash,
+    set_listener_cursor_ms,
+    tx_hash_already_used,
+)
+
 logger = logging.getLogger(__name__)
 
-# USDT TRC20 合约地址（TRON 主网）
 USDT_CONTRACT = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
-TRONGRID_API  = "https://api.trongrid.io"
+TRONGRID_API = "https://api.trongrid.io"
 
-# 每次从 TronGrid 拉取的最大条数（最大 200，建议 50）
-FETCH_LIMIT = 50
-
-# 免费 API 最小请求间隔（秒）：3 req/s → 至少 0.34s，取 2s 留足余量
+FETCH_LIMIT = 200
 MIN_POLL_INTERVAL = 2
 
 
 def sun_to_usdt(sun_value) -> Decimal:
-    """
-    链上 value 字段单位为"最小精度单位"，USDT TRC20 精度 6 位。
-    1 USDT = 1_000_000 sun。
-    全程使用字符串 → Decimal，不经过 float。
-    """
     return (Decimal(str(sun_value)) / Decimal("1000000")).quantize(
         Decimal("0.000001"), rounding=ROUND_DOWN
     )
+
+
+def _tx_block_timestamp_ms(tx: dict) -> int:
+    """从 TronGrid TRC20 记录提取 block_timestamp（毫秒）。"""
+    for key in ("block_timestamp", "blockTimestamp"):
+        raw = tx.get(key)
+        if raw is not None:
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                pass
+    return int(time.time() * 1000)
 
 
 class TronListener:
@@ -48,171 +60,195 @@ class TronListener:
         trongrid_api_key: str = "",
         poll_interval: int = 15,
     ):
-        self.wallet        = wallet_address
-        self.db_pool       = db_pool
-        self.bot           = bot
-        self.redis         = redis_client
-        self.api_key       = trongrid_api_key
-        # 实际使用值取配置值与最小值中的较大者，防止配置过小触发限速
+        self.wallet = wallet_address
+        self.db_pool = db_pool
+        self.bot = bot
+        self.redis = redis_client
+        self.api_key = trongrid_api_key
         self.poll_interval = max(poll_interval, MIN_POLL_INTERVAL)
-        # 内存去重集合，启动时从 DB 加载
         self._seen_tx: set[str] = set()
-        # 连续失败次数，用于指数退避
         self._fail_count: int = 0
-
-    # ------------------------------------------------------------------ #
-    # 公共入口
-    # ------------------------------------------------------------------ #
+        self._scan_min_ts: int = 0
 
     async def start(self):
-        logger.info("🔗 TronListener 启动 | 地址: %s | 轮询间隔: %ds",
-                    self.wallet, self.poll_interval)
+        logger.info(
+            "🔗 TronListener 启动 | 地址: %s | 轮询: %ds",
+            self.wallet,
+            self.poll_interval,
+        )
         await self._load_seen_tx()
+        await self._init_scan_cursor()
         while True:
             try:
                 await self._poll()
-                self._fail_count = 0                        # 成功后重置
+                self._fail_count = 0
             except aiohttp.ClientResponseError as exc:
-                if exc.status == 429:                       # 被限速
+                if exc.status == 429:
                     wait = min(60, 5 * (2 ** self._fail_count))
                     logger.warning("TronGrid 限速 429，%ds 后重试", wait)
                     self._fail_count += 1
                     await asyncio.sleep(wait)
                     continue
-                else:
-                    logger.error("HTTP 错误 %d: %s", exc.status, exc, exc_info=True)
-                    self._fail_count += 1
+                logger.error("HTTP 错误 %d: %s", exc.status, exc, exc_info=True)
+                self._fail_count += 1
             except Exception as exc:
                 logger.error("TronListener 轮询异常: %s", exc, exc_info=True)
                 self._fail_count += 1
 
             await asyncio.sleep(self.poll_interval)
 
-    # ------------------------------------------------------------------ #
-    # 内部方法
-    # ------------------------------------------------------------------ #
-
     async def _load_seen_tx(self):
-        """从 DB 加载近 7 天的 tx_hash，防重启后重复核销"""
-        from database import get_processed_tx_hashes
         hashes = await get_processed_tx_hashes(self.db_pool)
         self._seen_tx = set(hashes)
         logger.info("已加载历史 tx_hash: %d 条", len(self._seen_tx))
 
+    async def _init_scan_cursor(self):
+        """从 DB 恢复游标，并回退重叠窗口以防重启漏单。"""
+        stored = await get_listener_cursor_ms(self.db_pool)
+        now_ms = int(time.time() * 1000)
+        if stored > 0:
+            self._scan_min_ts = max(0, stored - LISTENER_OVERLAP_MS)
+            logger.info(
+                "链上扫描游标: DB=%d → 实际 min_ts=%d (重叠 %ds)",
+                stored,
+                self._scan_min_ts,
+                LISTENER_OVERLAP_MS // 1000,
+            )
+        else:
+            self._scan_min_ts = max(0, now_ms - LISTENER_DEFAULT_LOOKBACK_MS)
+            logger.info(
+                "首次扫描，回溯 %d 小时",
+                LISTENER_DEFAULT_LOOKBACK_MS // 3600000,
+            )
+
     async def _poll(self):
-        """
-        拉取最近 FETCH_LIMIT 条转入记录，逐条去重后处理。
-        短时间内同时有多笔转账时，全部都能被覆盖到。
-        """
-        transfers = await self._fetch_trc20_transfers()
+        transfers, max_ts = await self._fetch_trc20_transfers_since(self._scan_min_ts)
         if not transfers:
             return
 
+        processed_max = self._scan_min_ts
         for tx in transfers:
             tx_hash = tx.get("transaction_id", "").strip()
             if not tx_hash or tx_hash in self._seen_tx:
+                ts = _tx_block_timestamp_ms(tx)
+                processed_max = max(processed_max, ts)
                 continue
 
-            # TronGrid v1 TRC20 接口的 to_address / from_address 字段
-            to_addr   = tx.get("to_address",   tx.get("to",   "")).strip()
+            to_addr = tx.get("to_address", tx.get("to", "")).strip()
             from_addr = tx.get("from_address", tx.get("from", "")).strip()
 
             if to_addr.lower() != self.wallet.lower():
-                # 转出交易，忽略
                 self._seen_tx.add(tx_hash)
+                ts = _tx_block_timestamp_ms(tx)
+                processed_max = max(processed_max, ts)
                 continue
 
-            # value 字段是字符串形式的整数 sun 数量
-            raw_value   = tx.get("value", "0")
+            raw_value = tx.get("value", "0")
             usdt_amount = sun_to_usdt(raw_value)
+            ts = _tx_block_timestamp_ms(tx)
 
             logger.info(
-                "📥 转入 %s USDT | hash=%s | from=%s",
-                usdt_amount, tx_hash, from_addr,
+                "📥 转入 %s USDT | hash=%s | from=%s | ts=%s",
+                usdt_amount,
+                tx_hash,
+                from_addr,
+                ts,
             )
 
-            # 先加入内存 set，防止本轮循环内同一 hash 重入
             self._seen_tx.add(tx_hash)
-
-            # 核销处理（含 DB 写入）
             await self._on_transfer(tx_hash, usdt_amount, from_addr)
+            processed_max = max(processed_max, ts)
 
-    async def _fetch_trc20_transfers(self) -> list[dict]:
+        if max_ts > 0:
+            processed_max = max(processed_max, max_ts)
+
+        if processed_max > self._scan_min_ts:
+            self._scan_min_ts = processed_max + 1
+            await set_listener_cursor_ms(self.db_pool, processed_max)
+            logger.debug("游标已更新: %d", processed_max)
+
+    async def _fetch_trc20_transfers_since(
+        self, min_timestamp_ms: int
+    ) -> tuple[list[dict], int]:
         """
-        调用 TronGrid v1 接口，获取钱包最近 FETCH_LIMIT 条 TRC20 转账。
-        使用 only_to=true 只返回转入，减少无效数据量。
+        按 min_timestamp 增量拉取 TRC20 转入（支持 fingerprint 分页）。
+        返回 (交易列表, 本批最大 block_timestamp)。
         """
-        url    = f"{TRONGRID_API}/v1/accounts/{self.wallet}/transactions/trc20"
-        params = {
-            "contract_address": USDT_CONTRACT,
-            "only_to":          "true",
-            "limit":            FETCH_LIMIT,
-        }
+        url = f"{TRONGRID_API}/v1/accounts/{self.wallet}/transactions/trc20"
         headers = {"Accept": "application/json"}
         if self.api_key:
             headers["TRON-PRO-API-KEY"] = self.api_key
 
-        timeout = aiohttp.ClientTimeout(total=12)
+        all_rows: list[dict] = []
+        max_ts = 0
+        fingerprint = None
+
+        timeout = aiohttp.ClientTimeout(total=20)
         async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(url, params=params, timeout=timeout) as resp:
-                if resp.status == 429:
-                    raise aiohttp.ClientResponseError(
-                        resp.request_info, resp.history, status=429
-                    )
-                if resp.status != 200:
-                    logger.warning("TronGrid 非 200 响应: %d", resp.status)
-                    return []
-                data = await resp.json(content_type=None)
-                return data.get("data", [])
+            while True:
+                params = {
+                    "contract_address": USDT_CONTRACT,
+                    "only_to": "true",
+                    "limit": FETCH_LIMIT,
+                    "order_by": "block_timestamp,asc",
+                    "min_timestamp": str(max(0, min_timestamp_ms)),
+                }
+                if fingerprint:
+                    params["fingerprint"] = fingerprint
+
+                async with session.get(url, params=params, timeout=timeout) as resp:
+                    if resp.status == 429:
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info, resp.history, status=429
+                        )
+                    if resp.status != 200:
+                        logger.warning("TronGrid 非 200: %d", resp.status)
+                        break
+                    data = await resp.json(content_type=None)
+
+                batch = data.get("data", [])
+                for tx in batch:
+                    ts = _tx_block_timestamp_ms(tx)
+                    max_ts = max(max_ts, ts)
+                all_rows.extend(batch)
+
+                fingerprint = (data.get("meta") or {}).get("fingerprint")
+                if not fingerprint or len(batch) < FETCH_LIMIT:
+                    break
+
+        return all_rows, max_ts
 
     async def _on_transfer(
         self,
-        tx_hash:     str,
+        tx_hash: str,
         usdt_amount: Decimal,
-        from_addr:   str,
+        from_addr: str,
     ):
-        """
-        核销主流程：
-          1. 精确匹配未过期 pending 订单（DB 层保证）
-          2. 乐观锁 UPDATE status='paid'（防并发重入）
-          3. 记录 tx_hash 到 DB
-          4. 通知用户支付确认
-          5. 调用 fulfillment 提货
-        """
-        from database import (
-            find_pending_order_by_amount,
-            get_pending_order_by_id,
-            mark_order_paid,
-            record_tx_hash,
-            tx_hash_already_used,
+        from fulfillment import (
+            fulfill_purchase_after_paid,
+            notify_payment_received,
+            notify_recharge_completed,
         )
-        from fulfillment import fulfill_order
+        from settlement import atomic_mark_paid_and_record, atomic_settle_recharge
 
-        # ── 0. 链上哈希去重（内存 + DB 双检）──────────────────────────
         if await tx_hash_already_used(self.db_pool, tx_hash):
             logger.info("跳过已处理 tx: %s", tx_hash)
             return
 
-        # ── 1. 匹配：仅 pending + 未过期 + 无 tx_hash ─────────────────
         order = await find_pending_order_by_amount(self.db_pool, usdt_amount)
         if not order:
             logger.info(
-                "⚠️  %s USDT 未匹配到有效 pending 订单（过期/金额有误/已核销）",
+                "⚠️  %s USDT 无有效 pending 订单 tx=%s",
                 usdt_amount,
+                tx_hash,
             )
             await record_tx_hash(self.db_pool, tx_hash, None, usdt_amount)
             return
 
         order_id = order["id"]
-
-        # ── 1b. 核销前二次确认（防轮询窗口内状态变化）──────────────────
-        order = await get_pending_order_by_id(
-            self.db_pool, order_id, usdt_amount
-        )
+        order = await get_pending_order_by_id(self.db_pool, order_id, usdt_amount)
         if not order:
-            logger.warning(
-                "订单 #%d 二次校验失败，放弃核销 tx=%s", order_id, tx_hash
-            )
+            logger.warning("订单 #%d 二次校验失败 tx=%s", order_id, tx_hash)
             await record_tx_hash(self.db_pool, tx_hash, None, usdt_amount)
             return
 
@@ -221,56 +257,66 @@ class TronListener:
         order_type = order.get("order_type", "purchase")
         base_amount = order["amount"]
         final_amount = order["final_amount"]
+
         logger.info(
-            "✅ 匹配成功 | 订单 #%d | 用户 %d | 类型 %s | tx=%s",
-            order_id, user_tg_id, order_type, tx_hash,
+            "✅ 匹配 #%d | user=%d | type=%s | tx=%s",
+            order_id,
+            user_tg_id,
+            order_type,
+            tx_hash,
         )
 
-        # ── 2. 标记 paid 并写入订单表 tx_hash ─────────────────────────
-        updated = await mark_order_paid(self.db_pool, order_id, tx_hash)
-        if not updated:
-            logger.warning(
-                "订单 #%d 核销失败（非 pending/已过期/tx 重复）tx=%s",
-                order_id, tx_hash,
-            )
-            await record_tx_hash(self.db_pool, tx_hash, None, usdt_amount)
-            return
-
-        # ── 3. 审计表记录 ─────────────────────────────────────────────
-        await record_tx_hash(self.db_pool, tx_hash, order_id, usdt_amount)
-
-        # ── 4. 通知用户：收款确认 ─────────────────────────────────────
         try:
-            await self.bot.send_message(
-                user_tg_id,
-                f"✅ *收款已确认！*\n\n"
-                f"📋 订单号：`#{order_id}`\n"
-                f"💰 金额：`{usdt_amount} USDT`\n"
-                f"🔗 Tx：`{tx_hash}`\n\n"
-                f"⏳ 正在为您处理，请稍候...",
-                parse_mode="Markdown",
-            )
-        except Exception as e:
-            logger.error("发送确认消息失败 [user %d]: %s", user_tg_id, e)
+            if order_type == "recharge":
+                ok = await atomic_settle_recharge(
+                    self.db_pool,
+                    order_id,
+                    user_tg_id,
+                    base_amount,
+                    tx_hash,
+                    usdt_amount,
+                )
+                if not ok:
+                    logger.warning("充值事务核销失败 #%d tx=%s", order_id, tx_hash)
+                    await record_tx_hash(self.db_pool, tx_hash, None, usdt_amount)
+                    return
 
-        # ── 5. 收尾（异常由 fulfillment 通知用户 + 管理员）────────────
-        try:
-            await fulfill_order(
-                db_pool=self.db_pool,
-                bot=self.bot,
-                order_id=order_id,
-                user_tg_id=user_tg_id,
-                product_id=product_id,
-                order_type=order_type,
-                base_amount=base_amount,
-                redis_client=self.redis,
-                final_amount=final_amount,
-                tx_hash=tx_hash,
-            )
+                if self.redis and final_amount is not None:
+                    from amount_lock import release_amount_lock
+                    await release_amount_lock(self.redis, Decimal(str(final_amount)))
+
+                await notify_recharge_completed(
+                    self.bot,
+                    self.db_pool,
+                    user_tg_id,
+                    order_id,
+                    base_amount,
+                )
+            else:
+                ok = await atomic_mark_paid_and_record(
+                    self.db_pool, order_id, tx_hash, usdt_amount
+                )
+                if not ok:
+                    logger.warning("支付事务核销失败 #%d tx=%s", order_id, tx_hash)
+                    await record_tx_hash(self.db_pool, tx_hash, None, usdt_amount)
+                    return
+
+                await notify_payment_received(
+                    self.bot, user_tg_id, order_id, usdt_amount, tx_hash
+                )
+
+                await fulfill_purchase_after_paid(
+                    db_pool=self.db_pool,
+                    bot=self.bot,
+                    order_id=order_id,
+                    user_tg_id=user_tg_id,
+                    product_id=product_id,
+                    tx_hash=tx_hash,
+                    final_amount=final_amount,
+                    redis_client=self.redis,
+                )
         except Exception as e:
-            logger.error(
-                "订单 #%d 收尾异常 tx=%s: %s", order_id, tx_hash, e, exc_info=True
-            )
+            logger.error("核销事务异常 #%d: %s", order_id, e, exc_info=True)
             from notifications import format_fulfillment_alert, notify_admin
 
             await notify_admin(
@@ -279,7 +325,7 @@ class TronListener:
                     order_id=order_id,
                     user_tg_id=user_tg_id,
                     order_type=order_type,
-                    reason=f"监听器收尾异常: {e}",
+                    reason=f"核销事务异常: {e}",
                     tx_hash=tx_hash,
                     final_amount=final_amount,
                 ),

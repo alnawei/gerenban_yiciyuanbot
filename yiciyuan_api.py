@@ -1,24 +1,39 @@
 """
 yiciyuan_api.py
 一次元 API 封装：签名、请求、商品拉取、下单提货。
+网络/HTTP 异常时记录日志并向管理员发送 Telegram 告警。
 """
 
 import hashlib
-import aiohttp
 import logging
+
+import aiohttp
 
 logger = logging.getLogger(__name__)
 
 
+class YiCiyuanAPIError(Exception):
+    """一次元 API 调用失败。"""
+
+    def __init__(self, endpoint: str, message: str, *, http_status: int | None = None):
+        self.endpoint = endpoint
+        self.http_status = http_status
+        super().__init__(message)
+
+
 class YiCiyuanAPI:
-    def __init__(self, shop_url: str, app_id: str, app_key: str):
+    def __init__(
+        self,
+        shop_url: str,
+        app_id: str,
+        app_key: str,
+        bot=None,
+    ):
         self.base_url = shop_url.rstrip("/")
         self.app_id = app_id
         self.app_key = app_key
+        self.bot = bot
 
-    # ------------------------------------------------------------------
-    # 签名
-    # ------------------------------------------------------------------
     def generate_sign(self, data: dict) -> str:
         filtered = {k: v for k, v in data.items() if v != "" and k != "sign"}
         sorted_keys = sorted(filtered.keys())
@@ -26,9 +41,21 @@ class YiCiyuanAPI:
         sign_str = f"{query_string}&key={self.app_key}"
         return hashlib.md5(sign_str.encode("utf-8")).hexdigest()
 
-    # ------------------------------------------------------------------
-    # 通用 POST
-    # ------------------------------------------------------------------
+    async def _alert_admin(self, endpoint: str, reason: str, extra: str = ""):
+        logger.error("一次元 API [%s]: %s %s", endpoint, reason, extra)
+        if not self.bot:
+            return
+        from notifications import notify_admin
+
+        body = (
+            "🚨 *一次元 API 异常*\n\n"
+            f"📡 端点：`{endpoint}`\n"
+            f"❗ 原因：{reason}"
+        )
+        if extra:
+            body += f"\n📎 详情：`{extra}`"
+        await notify_admin(self.bot, body)
+
     async def post(self, endpoint: str, data: dict | None = None) -> dict:
         if data is None:
             data = {}
@@ -43,27 +70,28 @@ class YiCiyuanAPI:
                     timeout=aiohttp.ClientTimeout(total=15),
                 ) as resp:
                     if resp.status == 200:
-                        return await resp.json()
-                    return {"code": resp.status, "msg": "网络请求失败"}
+                        result = await resp.json()
+                        code = result.get("code")
+                        if code not in (0, None, "0") and "/order/" in endpoint:
+                            msg = result.get("msg", "业务错误")
+                            await self._alert_admin(
+                                endpoint,
+                                f"业务码 {code}: {msg}",
+                            )
+                        return result
+                    msg = f"HTTP {resp.status}"
+                    await self._alert_admin(endpoint, msg)
+                    raise YiCiyuanAPIError(endpoint, msg, http_status=resp.status)
+        except YiCiyuanAPIError:
+            raise
         except Exception as e:
-            logger.error("API 请求异常 [%s]: %s", endpoint, e)
-            return {"code": 500, "msg": str(e)}
+            await self._alert_admin(endpoint, "请求异常", str(e))
+            raise YiCiyuanAPIError(endpoint, str(e)) from e
 
-    # ------------------------------------------------------------------
-    # 业务接口
-    # ------------------------------------------------------------------
     async def get_items(self) -> dict:
-        """获取全量商品列表"""
         return await self.post("/shared/commodity/items")
 
     async def create_order(self, commodity_code: str, order_id: str) -> dict:
-        """
-        下单提货。
-        接口文档字段（一次元标准）：
-          commodity_code  商品编码
-          out_order_no    外部订单号（用我们自己的 order_id）
-          num             购买数量，固定 1
-        """
         return await self.post(
             "/shared/order/create",
             {
@@ -74,7 +102,6 @@ class YiCiyuanAPI:
         )
 
     async def query_order(self, order_id: str) -> dict:
-        """查询订单状态（用于重试核查）"""
         return await self.post(
             "/shared/order/query",
             {"out_order_no": order_id},

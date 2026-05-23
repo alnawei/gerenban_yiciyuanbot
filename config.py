@@ -48,3 +48,55 @@ USDT_WALLET = os.getenv("USDT_WALLET", "")
 TRONGRID_API_KEY = os.getenv("TRONGRID_API_KEY", "")
 TRON_POLL_INTERVAL = _int_env("TRON_POLL_INTERVAL", 15)
 ORDER_EXPIRE_MINUTES = _int_env("ORDER_EXPIRE_MINUTES", 30)
+
+# ── 占位符检测（生产启动自检）────────────────────────────────
+_PLACEHOLDER_BOT_TOKENS = frozenset({
+    "",
+    "your_telegram_bot_token",
+    "your_bot_token_here",
+    "changeme",
+})
+_PLACEHOLDER_DB_PASSWORDS = frozenset({
+    "",
+    "your_mysql_password",
+    "changeme",
+})
+_PLACEHOLDER_WALLETS = frozenset({
+    "",
+    "t_your_wallet_address_here",
+    "tyourtronwalletaddress",
+    "your_wallet_here",
+    "changeme",
+})
+
+
+def _is_placeholder(value: str, placeholders: frozenset[str]) -> bool:
+    return value.strip().lower() in placeholders
+
+
+def validate_production_env() -> None:
+    """
+    启动前校验核心环境变量；仍为占位符或明显无效时抛出 RuntimeError。
+    """
+    errors: list[str] = []
+
+    if _is_placeholder(BOT_TOKEN, _PLACEHOLDER_BOT_TOKENS):
+        errors.append("BOT_TOKEN 未配置或仍为 .env.example 占位符")
+
+    if ADMIN_ID <= 0:
+        errors.append("ADMIN_ID 未配置或无效（需为 Telegram 数字 ID）")
+
+    if _is_placeholder(DB_CONFIG.get("password", ""), _PLACEHOLDER_DB_PASSWORDS):
+        errors.append("DB_PASSWORD 未配置或仍为占位符")
+
+    wallet = USDT_WALLET.strip()
+    if _is_placeholder(wallet, _PLACEHOLDER_WALLETS):
+        errors.append("USDT_WALLET 未配置或仍为占位符")
+    elif not wallet.startswith("T") or len(wallet) < 30:
+        errors.append("USDT_WALLET 格式无效（TRON 地址应以 T 开头）")
+
+    if errors:
+        raise RuntimeError(
+            "生产环境配置检查失败，请修正 .env 后重试：\n- "
+            + "\n- ".join(errors)
+        )

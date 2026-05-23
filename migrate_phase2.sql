@@ -83,10 +83,11 @@ CREATE TABLE IF NOT EXISTS delivery_records (
 -- 5. system_config 默认行（幂等，可重复执行）
 -- ────────────────────────────────────────────────────────────
 INSERT IGNORE INTO system_config (config_key, config_value) VALUES
-    ('shop_url',          ''),
-    ('app_id',            ''),
-    ('app_key',           ''),
-    ('customer_service',  '');
+    ('shop_url',               ''),
+    ('app_id',                 ''),
+    ('app_key',                ''),
+    ('customer_service',       ''),
+    ('tron_listener_min_ts',   '0');
 
 
 -- ────────────────────────────────────────────────────────────

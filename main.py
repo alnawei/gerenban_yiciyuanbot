@@ -26,6 +26,7 @@ from config import (
     TRONGRID_API_KEY,
     TRON_POLL_INTERVAL,
     ORDER_EXPIRE_MINUTES,
+    validate_production_env,
 )
 from database import (
     get_db_pool,
@@ -39,7 +40,7 @@ from database import (
     expire_stale_orders,
 )
 from payments import place_payment_order, quantize_base
-from yiciyuan_api import YiCiyuanAPI
+from yiciyuan_api import YiCiyuanAPI, YiCiyuanAPIError
 
 # ============================================================
 # 初始化
@@ -721,8 +722,12 @@ async def auto_sync_task(db_pool):
             app_key = config.get("app_key")
             if not all([shop_url, app_id, app_key]):
                 continue
-            api = YiCiyuanAPI(shop_url, app_id, app_key)
-            result = await api.get_items()
+            api = YiCiyuanAPI(shop_url, app_id, app_key, bot=bot)
+            try:
+                result = await api.get_items()
+            except YiCiyuanAPIError as e:
+                logger.error("自动同步 API 失败: %s", e)
+                continue
             if result.get("code") == 0:
                 categories = result.get("data", {}).get("list", [])
                 count = await save_remote_products(db_pool, categories)
@@ -763,10 +768,7 @@ async def tron_listener_task(db_pool, redis_client):
 # ============================================================
 
 async def start_bot():
-    if not BOT_TOKEN:
-        raise RuntimeError("未配置 BOT_TOKEN，请复制 .env.example 为 .env 并填写")
-    if not USDT_WALLET:
-        logger.warning("未配置 USDT_WALLET，购买/充值付款流程将不可用")
+    validate_production_env()
 
     db_pool = await get_db_pool()
     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
@@ -779,10 +781,9 @@ async def start_bot():
 
     asyncio.create_task(auto_sync_task(db_pool))
     asyncio.create_task(order_expire_task(db_pool, redis_client))
-    if USDT_WALLET:
-        asyncio.create_task(tron_listener_task(db_pool, redis_client))
+    asyncio.create_task(tron_listener_task(db_pool, redis_client))
 
-    logger.info("🚀 Bot 已启动%s", "，链上监听已开启" if USDT_WALLET else "")
+    logger.info("🚀 Bot 已启动，链上监听已开启")
 
     try:
         await dp.start_polling(bot)

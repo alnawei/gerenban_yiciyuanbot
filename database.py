@@ -53,6 +53,38 @@ async def update_system_config(pool, url: str, app_id: str, app_key: str):
             await cur.execute(sql, (app_key, "app_key"))
 
 
+LISTENER_CURSOR_KEY = "tron_listener_min_ts"
+# 重启后回扫重叠窗口（毫秒），防止边界漏单
+LISTENER_OVERLAP_MS = 5 * 60 * 1000
+# 首次运行无游标时的默认回溯（7 天）
+LISTENER_DEFAULT_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000
+
+
+async def get_listener_cursor_ms(pool) -> int:
+    """读取链上扫描游标（毫秒时间戳），0 表示从未扫描。"""
+    config = await get_system_config(pool)
+    raw = config.get(LISTENER_CURSOR_KEY, "0") or "0"
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+async def set_listener_cursor_ms(pool, timestamp_ms: int) -> None:
+    """持久化链上扫描游标，供重启后增量拉取。"""
+    ts = max(0, int(timestamp_ms))
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                INSERT INTO system_config (config_key, config_value)
+                VALUES (%s, %s)
+                ON DUPLICATE KEY UPDATE config_value = VALUES(config_value)
+                """,
+                (LISTENER_CURSOR_KEY, str(ts)),
+            )
+
+
 # ============================================================
 # 商品
 # ============================================================
