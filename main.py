@@ -3,36 +3,42 @@ main.py
 Telegram 机器人主入口 — Phase 1 + Phase 2 完整版
 """
 
-# 日志初始化必须最先执行
-from logger_setup import setup_logging
-setup_logging()
-
 import asyncio
 import logging
-import random
 import time
-from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
+from typing import Any, Awaitable, Callable
 
 import aiomysql
 import redis.asyncio as redis
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-# 自定义模块
+from amount_lock import release_amount_lock
 from config import (
-    BOT_TOKEN, ADMIN_ID, REDIS_URL,
-    USDT_WALLET, TRONGRID_API_KEY, TRON_POLL_INTERVAL, ORDER_EXPIRE_MINUTES,
+    BOT_TOKEN,
+    ADMIN_ID,
+    REDIS_URL,
+    USDT_WALLET,
+    TRONGRID_API_KEY,
+    TRON_POLL_INTERVAL,
+    ORDER_EXPIRE_MINUTES,
 )
 from database import (
-    get_db_pool, get_system_config, update_system_config,
-    save_remote_products, get_active_categories, get_user_data, get_shop_stats,
-    get_product_by_id, create_order, expire_stale_orders,
-    get_failed_fulfillment_orders,
+    get_db_pool,
+    get_system_config,
+    update_system_config,
+    save_remote_products,
+    get_user_data,
+    get_shop_stats,
+    get_product_by_id,
+    get_order_by_id,
+    expire_stale_orders,
 )
+from payments import place_payment_order, quantize_base
 from yiciyuan_api import YiCiyuanAPI
 
 # ============================================================
@@ -48,6 +54,22 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 
+class InjectMiddleware(BaseMiddleware):
+    def __init__(self, db_pool, redis_client):
+        self.db_pool = db_pool
+        self.redis_client = redis_client
+
+    async def __call__(
+        self,
+        handler: Callable[[Any, dict[str, Any]], Awaitable[Any]],
+        event: Any,
+        data: dict[str, Any],
+    ) -> Any:
+        data["db_pool"] = self.db_pool
+        data["redis_client"] = self.redis_client
+        return await handler(event, data)
+
+
 class AdminSetup(StatesGroup):
     waiting_for_url = State()
     waiting_for_id = State()
@@ -56,6 +78,51 @@ class AdminSetup(StatesGroup):
     waiting_for_new_name = State()
     waiting_for_new_cat_name = State()
     waiting_for_price = State()        # Phase 2: 设置价格
+
+
+class UserRecharge(StatesGroup):
+    waiting_for_amount = State()
+
+
+def _customer_service_url(customer_service: str) -> str:
+    if customer_service.startswith("http"):
+        return customer_service
+    return f"https://t.me/{customer_service.lstrip('@')}"
+
+
+def build_payment_keyboard(order_id: int, customer_service: str = "") -> types.InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    if customer_service:
+        builder.button(text="💬 联系客服", url=_customer_service_url(customer_service))
+    builder.button(text="❌ 取消订单", callback_data=f"cancel_order_{order_id}")
+    builder.adjust(1)
+    return builder.as_markup()
+
+
+def format_payment_message(
+    *,
+    title_line: str,
+    detail_lines: str,
+    order_id: int,
+    final_amount: Decimal,
+) -> str:
+    amount_display = f"{final_amount:.6f}"
+    return (
+        f"{title_line}\n\n"
+        f"{detail_lines}\n"
+        f"📋 订单号：`#{order_id}`\n\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"💳 *转账信息*\n\n"
+        f"  网络：`TRC20 (TRON)`\n"
+        f"  币种：`USDT`\n\n"
+        f"  收款地址：\n"
+        f"  `{USDT_WALLET}`\n\n"
+        f"  ⚠️ *必须转入精确金额*：\n"
+        f"  # `{amount_display} USDT` #\n\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"转账后系统将 *自动核销*，无需手动通知。\n"
+        f"⏰ 订单有效期 *{ORDER_EXPIRE_MINUTES} 分钟*，超时自动关闭。"
+    )
 
 
 # ============================================================
@@ -84,7 +151,6 @@ async def admin_menu(message: types.Message, db_pool):
         )
         builder.button(text=f"🔄 立即同步 ({total_count})", callback_data="sync_now")
         builder.button(text=f"📦 上架管理 ({active_count})", callback_data="admin_manage_goods")
-        builder.button(text="🚨 发货失败订单", callback_data="admin_failed_orders")
         builder.button(text="👤 设置客服地址", callback_data="set_customer_service")
         builder.button(text="❌ 删除商铺配置", callback_data="delete_shop")
 
@@ -434,11 +500,81 @@ async def cmd_me(message: types.Message, db_pool):
     text = (
         f"👤 **个人中心**\n\n"
         f"🆔 ID: `{message.from_user.id}`\n"
-        f"💰 余额: `{user['balance']:.2f}` USDT"
+        f"💰 余额: `{user['balance']:.6f}` USDT"
     )
     builder = InlineKeyboardBuilder()
     builder.button(text="💳 立即充值", callback_data="recharge")
     await message.answer(text, reply_markup=builder.as_markup(), parse_mode="Markdown")
+
+
+# ============================================================
+# 用户端：余额充值
+# ============================================================
+
+@dp.callback_query(F.data == "recharge")
+async def cb_recharge(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer(
+        "💳 *余额充值*\n\n"
+        "请输入充值金额（USDT，正数，最多两位小数）：\n"
+        "输入 `cancel` 取消",
+        parse_mode="Markdown",
+    )
+    await state.set_state(UserRecharge.waiting_for_amount)
+    await callback.answer()
+
+
+@dp.message(UserRecharge.waiting_for_amount)
+async def process_recharge_amount(
+    message: types.Message,
+    state: FSMContext,
+    db_pool,
+    redis_client,
+):
+    text = message.text.strip()
+    if text.lower() == "cancel":
+        await state.clear()
+        return await message.answer("❌ 已取消充值。")
+
+    try:
+        base_amount = quantize_base(Decimal(text))
+        if base_amount <= 0:
+            raise ValueError
+    except Exception:
+        return await message.answer("⚠️ 请输入有效的正数金额，例如：100 或 50.5")
+
+    if not USDT_WALLET:
+        await state.clear()
+        return await message.answer("⚠️ 系统尚未配置收款地址，请联系管理员。")
+
+    user_tg_id = message.from_user.id
+    result = await place_payment_order(
+        db_pool,
+        redis_client,
+        user_tg_id,
+        base_amount,
+        order_type="recharge",
+        product_id=None,
+        expire_minutes=ORDER_EXPIRE_MINUTES,
+    )
+    if not result:
+        return await message.answer("⚠️ 当前充值通道繁忙，请稍后重试。")
+
+    order_id, final_amount = result
+    config = await get_system_config(db_pool)
+    customer_service = config.get("customer_service", "")
+
+    pay_text = format_payment_message(
+        title_line=f"💳 *充值订单已创建，请在 {ORDER_EXPIRE_MINUTES} 分钟内完成付款*",
+        detail_lines=f"💰 充值面额：`{base_amount} USDT`",
+        order_id=order_id,
+        final_amount=final_amount,
+    )
+    await message.answer(
+        pay_text,
+        reply_markup=build_payment_keyboard(order_id, customer_service),
+        parse_mode="Markdown",
+    )
+    await state.clear()
 
 
 # ============================================================
@@ -492,14 +628,11 @@ async def back_to_shop(callback: types.CallbackQuery, db_pool):
 # ============================================================
 
 @dp.callback_query(F.data.startswith("buy_"))
-async def buy_product(callback: types.CallbackQuery, db_pool):
-    """
-    用户点击商品 → 生成附随机小数的唯一 final_amount → 展示付款地址。
+async def buy_product(callback: types.CallbackQuery, db_pool, redis_client):
+    """用户购买商品：Redis 预锁 + DB 唯一金额 + 展示付款信息。"""
+    if not USDT_WALLET:
+        return await callback.answer("系统未配置收款地址", show_alert=True)
 
-    防冲突：不重复抽取 offset，最多 20 次；冲突报错时提示稍后重试。
-    手续费提示：明确告知交易所提现需自补手续费。
-    倒计时：消息中显示精确截止时间。
-    """
     p_id = int(callback.data.replace("buy_", ""))
     user_tg_id = callback.from_user.id
 
@@ -511,193 +644,66 @@ async def buy_product(callback: types.CallbackQuery, db_pool):
     if not price:
         return await callback.answer("❌ 该商品尚未设置价格，请联系客服", show_alert=True)
 
-    base_amount = Decimal(str(price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
-
-    # ── 生成唯一 final_amount ────────────────────────────────────────
-    order_id:      int | None     = None
-    final_amount:  Decimal | None = None
-    tried_offsets: set[int]       = set()
-
-    for _ in range(20):
-        remaining = set(range(1, 100)) - tried_offsets
-        if not remaining:
-            break
-        offset_int = random.choice(list(remaining))
-        tried_offsets.add(offset_int)
-        candidate = (base_amount + Decimal(offset_int) / Decimal("100")).quantize(
-            Decimal("0.01")
-        )
-        result = await create_order(
-            db_pool, user_tg_id, p_id, base_amount, candidate,
-            expire_minutes=ORDER_EXPIRE_MINUTES,
-        )
-        if result:
-            order_id, final_amount = result, candidate
-            break
-
-    if not order_id:
-        logger.error(
-            "用户 %d 下单失败：base=%s，已试 %d 个 offset 全部冲突",
-            user_tg_id, base_amount, len(tried_offsets),
-        )
+    base_amount = quantize_base(Decimal(str(price)))
+    result = await place_payment_order(
+        db_pool,
+        redis_client,
+        user_tg_id,
+        base_amount,
+        order_type="purchase",
+        product_id=p_id,
+        expire_minutes=ORDER_EXPIRE_MINUTES,
+    )
+    if not result:
         return await callback.answer(
             "⚠️ 当前价格档位已满，请稍后重试或联系客服", show_alert=True
         )
 
-    # ── 计算截止时间字符串（UTC+8）──────────────────────────────────
-    from datetime import datetime, timedelta
-    expire_dt  = datetime.utcnow() + timedelta(minutes=ORDER_EXPIRE_MINUTES, hours=8)
-    expire_str = expire_dt.strftime("%H:%M")   # 显示"XX:XX 前"
-
-    product_name     = product.get("display_name") or product.get("remote_name")
-    config           = await get_system_config(db_pool)
+    order_id, final_amount = result
+    product_name = product.get("display_name") or product.get("remote_name")
+    config = await get_system_config(db_pool)
     customer_service = config.get("customer_service", "")
 
-    builder = InlineKeyboardBuilder()
-    if customer_service:
-        cs_url = (
-            customer_service
-            if customer_service.startswith("http")
-            else f"https://t.me/{customer_service.lstrip('@')}"
-        )
-        builder.button(text="💬 联系客服", url=cs_url)
-    builder.button(
-        text=f"❌ 取消订单（剩余 {ORDER_EXPIRE_MINUTES} 分钟）",
-        callback_data=f"cancel_order_{order_id}",
+    pay_text = format_payment_message(
+        title_line=f"🛒 *下单成功，请在 {ORDER_EXPIRE_MINUTES} 分钟内完成付款*",
+        detail_lines=f"📦 商品：{product_name}",
+        order_id=order_id,
+        final_amount=final_amount,
     )
-    builder.adjust(1)
-
-    pay_text = (
-        f"🛒 *下单成功！请在* `{expire_str}` *前完成付款*\n\n"
-        f"📦 商品：{product_name}\n"
-        f"📋 订单号：`#{order_id}`\n\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"💳 *转账信息（TRC20-USDT）*\n\n"
-        f"收款地址：\n"
-        f"`{USDT_WALLET}`\n\n"
-        f"⚠️ *必须转入以下精确金额：*\n"
-        f"# `{final_amount} USDT` #\n\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"🏦 *从交易所（币安/欧易等）提现请注意：*\n"
-        f"交易所会额外扣除手续费（通常 1\~2 USDT），\n"
-        f"请在提现金额中*自行加上手续费*，确保\n"
-        f"*实际到账金额*恰好为 `{final_amount} USDT`。\n\n"
-        f"━━━━━━━━━━━━━━\n"
-        f"转账后系统将 *自动核销发货*，无需通知。\n"
-        f"⏰ 订单 *{ORDER_EXPIRE_MINUTES} 分钟*后失效，超时请重新下单。"
-    )
-
     await callback.message.answer(
-        pay_text, reply_markup=builder.as_markup(), parse_mode="Markdown"
+        pay_text,
+        reply_markup=build_payment_keyboard(order_id, customer_service),
+        parse_mode="Markdown",
     )
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("cancel_order_"))
-async def cancel_order(callback: types.CallbackQuery, db_pool):
-    """用户主动取消待支付订单，立即释放 final_amount 坑位。"""
-    order_id   = int(callback.data.replace("cancel_order_", ""))
+async def cancel_order(callback: types.CallbackQuery, db_pool, redis_client):
+    """用户主动取消待支付订单，并释放 Redis 金额锁。"""
+    order_id = int(callback.data.replace("cancel_order_", ""))
     user_tg_id = callback.from_user.id
 
-    async with db_pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            # 同时检查是否已过期，给出不同提示
-            await cur.execute(
-                "SELECT status FROM recharge_orders WHERE id=%s AND user_id=%s",
-                (order_id, user_tg_id),
-            )
-            row = await cur.fetchone()
-
-    if not row:
-        return await callback.answer("❌ 订单不存在", show_alert=True)
-
-    if row["status"] == "expired":
-        return await callback.answer(
-            "⏰ 该订单已超时失效，无需取消。如需购买请重新下单。",
-            show_alert=True,
-        )
-    if row["status"] != "pending":
-        return await callback.answer(
-            "该订单已支付或处理中，无法取消。如有问题请联系客服。",
-            show_alert=True,
-        )
+    order = await get_order_by_id(db_pool, order_id)
+    if not order or order["user_id"] != user_tg_id or order["status"] != "pending":
+        return await callback.answer("订单已处理，无法取消", show_alert=True)
 
     async with db_pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
-                "UPDATE recharge_orders SET status='cancelled' "
-                "WHERE id=%s AND user_id=%s AND status='pending'",
+                """
+                UPDATE recharge_orders SET status='cancelled'
+                WHERE id=%s AND user_id=%s AND status='pending'
+                """,
                 (order_id, user_tg_id),
             )
             updated = cur.rowcount
 
     if updated:
-        await callback.message.edit_text(
-            f"❌ 订单 `#{order_id}` 已取消，金额坑位已释放。",
-            parse_mode="Markdown",
-        )
+        await release_amount_lock(redis_client, Decimal(str(order["final_amount"])))
+        await callback.message.edit_text(f"❌ 订单 `#{order_id}` 已取消。", parse_mode="Markdown")
     else:
-        await callback.answer("操作失败，请重试", show_alert=True)
-
-
-# ============================================================
-# 管理员：手动补发
-# ============================================================
-
-@dp.callback_query(F.data.startswith("admin_retry_"), F.from_user.id == ADMIN_ID)
-async def admin_retry_fulfill(callback: types.CallbackQuery, db_pool):
-    """管理员点击"手动补发"按钮，调用 fulfillment.retry_fulfill_order。"""
-    from fulfillment import retry_fulfill_order
-    order_id = int(callback.data.replace("admin_retry_", ""))
-
-    await callback.message.edit_text(
-        f"🔁 正在为订单 `#{order_id}` 执行补发...",
-        parse_mode="Markdown",
-    )
-    await callback.answer()
-
-    await retry_fulfill_order(db_pool, bot, order_id)
-
-    # 补发完成后更新按钮消息
-    try:
-        await callback.message.edit_text(
-            f"✅ 订单 `#{order_id}` 补发指令已下发，请查看用户是否收到货。",
-            parse_mode="Markdown",
-        )
-    except Exception:
-        pass
-
-
-@dp.callback_query(F.data == "admin_failed_orders", F.from_user.id == ADMIN_ID)
-async def admin_failed_orders(callback: types.CallbackQuery, db_pool):
-    """显示最近 20 条发货失败的订单列表。"""
-    orders = await get_failed_fulfillment_orders(db_pool, limit=20)
-
-    if not orders:
-        return await callback.answer("✅ 暂无发货失败订单", show_alert=True)
-
-    builder = InlineKeyboardBuilder()
-    lines   = ["🚨 *发货失败订单列表*\n"]
-    for o in orders:
-        name      = o.get("display_name") or o.get("remote_name") or "未知商品"
-        short_err = (o.get("error_msg") or "")[:20]
-        lines.append(
-            f"• `#{o['id']}` {name[:10]} | 用户 `{o['user_id']}` | {short_err}"
-        )
-        builder.button(
-            text=f"🔁 补发 #{o['id']}",
-            callback_data=f"admin_retry_{o['id']}",
-        )
-
-    builder.adjust(1)
-    builder.row(types.InlineKeyboardButton(text="⬅️ 返回", callback_data="back_to_admin"))
-
-    await callback.message.edit_text(
-        "\n".join(lines),
-        reply_markup=builder.as_markup(),
-        parse_mode="Markdown",
-    )
-    await callback.answer()
+        await callback.answer("订单已处理，无法取消", show_alert=True)
 
 
 # ============================================================
@@ -725,23 +731,27 @@ async def auto_sync_task(db_pool):
             logger.error("自动同步异常: %s", e)
 
 
-async def order_expire_task(db_pool):
-    """每 5 分钟清理 expires_at 已过的 pending 订单，释放 final_amount 坑位"""
+async def order_expire_task(db_pool, redis_client):
+    """每 5 分钟清理过期 pending 订单，并释放 Redis 金额锁。"""
     while True:
         await asyncio.sleep(300)
         try:
-            await expire_stale_orders(db_pool)
+            expired_amounts = await expire_stale_orders(db_pool)
+            for amount in expired_amounts:
+                await release_amount_lock(redis_client, amount)
         except Exception as e:
             logger.error("过期订单清理异常: %s", e)
 
 
-async def tron_listener_task(db_pool):
+async def tron_listener_task(db_pool, redis_client):
     """启动 TronGrid 链上监听"""
     from tron_listener import TronListener
+
     listener = TronListener(
         wallet_address=USDT_WALLET,
         db_pool=db_pool,
         bot=bot,
+        redis_client=redis_client,
         trongrid_api_key=TRONGRID_API_KEY,
         poll_interval=TRON_POLL_INTERVAL,
     )
@@ -753,24 +763,31 @@ async def tron_listener_task(db_pool):
 # ============================================================
 
 async def start_bot():
+    if not BOT_TOKEN:
+        raise RuntimeError("未配置 BOT_TOKEN，请复制 .env.example 为 .env 并填写")
+    if not USDT_WALLET:
+        logger.warning("未配置 USDT_WALLET，购买/充值付款流程将不可用")
+
     db_pool = await get_db_pool()
     redis_client = redis.from_url(REDIS_URL, decode_responses=True)
 
     dp["db_pool"] = db_pool
     dp["redis"] = redis_client
+    dp.update.middleware(InjectMiddleware(db_pool, redis_client))
 
     await bot.delete_webhook(drop_pending_updates=True)
 
-    # 启动后台任务
     asyncio.create_task(auto_sync_task(db_pool))
-    asyncio.create_task(order_expire_task(db_pool))
-    asyncio.create_task(tron_listener_task(db_pool))
+    asyncio.create_task(order_expire_task(db_pool, redis_client))
+    if USDT_WALLET:
+        asyncio.create_task(tron_listener_task(db_pool, redis_client))
 
-    logger.info("🚀 Bot 已启动，链上监听已开启")
+    logger.info("🚀 Bot 已启动%s", "，链上监听已开启" if USDT_WALLET else "")
 
     try:
         await dp.start_polling(bot)
     finally:
+        await redis_client.aclose()
         await db_pool.close()
         await bot.session.close()
 

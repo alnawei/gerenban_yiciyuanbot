@@ -1,40 +1,50 @@
-# config.py — 所有配置集中在此，不在任何其他文件硬编码
+# config.py — 敏感项从 .env 读取，勿在此硬编码密钥
+
+import os
+
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def _int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return int(raw)
+
+
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    return float(raw)
+
 
 # ── Telegram ─────────────────────────────────────────────────
-BOT_TOKEN = "AAGHNPASj2o7qVslXzhH67-mSHOZuKerhZA"
-ADMIN_ID  = 123456  # 管理员 TG 数字 ID
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_ID = _int_env("ADMIN_ID", 0)
 
-# ── 数据库（1Panel 默认） ──────────────────────────────────────
+# ── 数据库 ───────────────────────────────────────────────────
 DB_CONFIG = {
-    "host":    "127.0.0.1",
-    "port":    3306,
-    "user":    "tg_bot_db",
-    "password":"pass",
-    "db":      "tg_bot_db",
+    "host": os.getenv("DB_HOST", "127.0.0.1"),
+    "port": _int_env("DB_PORT", 3306),
+    "user": os.getenv("DB_USER", "tg_bot_db"),
+    "password": os.getenv("DB_PASSWORD", ""),
+    "db": os.getenv("DB_NAME", "tg_bot_db"),
     "charset": "utf8mb4",
-    # 连接池参数（防止连接数爆炸）
     "minsize": 2,
     "maxsize": 10,
 }
 
 # ── Redis ─────────────────────────────────────────────────────
-REDIS_URL = "redis://127.0.0.1:6379/0"
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0")
 
 # ── 业务 ─────────────────────────────────────────────────────
-DEFAULT_MARKUP_PERCENT = 0.2  # 商品未单独设价时的默认加价比例
+DEFAULT_MARKUP_PERCENT = _float_env("DEFAULT_MARKUP_PERCENT", 0.2)
 
 # ── 支付（Phase 2）───────────────────────────────────────────
-# 你的 USDT TRC20 固定收款钱包地址（必填）
-USDT_WALLET = "T_YOUR_WALLET_ADDRESS_HERE"
-
-# TronGrid API Key（可选，免费申请 https://www.trongrid.io）
-# 填写后速率上限大幅提升；留空则使用公共节点（3 req/s）
-TRONGRID_API_KEY = ""
-
-# 链上轮询间隔（秒）
-# 免费节点建议 >= 15；有 API Key 可调至 5
-TRON_POLL_INTERVAL = 15
-
-# 订单有效期（分钟）：超时后 final_amount 坑位自动释放
-# 建议 20~30 分钟，与用户付款窗口期匹配
-ORDER_EXPIRE_MINUTES = 30
+USDT_WALLET = os.getenv("USDT_WALLET", "")
+TRONGRID_API_KEY = os.getenv("TRONGRID_API_KEY", "")
+TRON_POLL_INTERVAL = _int_env("TRON_POLL_INTERVAL", 15)
+ORDER_EXPIRE_MINUTES = _int_env("ORDER_EXPIRE_MINUTES", 30)

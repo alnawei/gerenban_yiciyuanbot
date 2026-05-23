@@ -1,22 +1,31 @@
 """
-database.py — 完整版 v3
-本次新增：
-  - set_fulfillment_status()：写入 recharge_orders.fulfillment_status
-  - get_failed_fulfillment_orders()：管理员查看待补发列表
-  - find_pending_order_by_amount 精度阈值统一为 0.000001
-  - get_processed_tx_hashes 仅加载近 7 天记录
+database.py — 完整版，修复所有已知问题
+修复点：
+  - find_pending_order_by_amount 过滤已过期订单
+  - expire_stale_orders 改用 expires_at 字段（精确到分钟）
+  - create_order 写入 expires_at
+  - DECIMAL(20,6) 统一精度，金额全程字符串传参
+  - get_processed_tx_hashes 只加载近 7 天记录，防内存溢出
 """
 
 import logging
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
+
 import aiomysql
+
 from config import DB_CONFIG
 
 logger = logging.getLogger(__name__)
 
+AMOUNT_QUANT = Decimal("0.000001")
+
+
+def normalize_amount(amount: Decimal) -> Decimal:
+    """与 migrate_phase2 DECIMAL(20,6) 对齐。"""
+    return Decimal(str(amount)).quantize(AMOUNT_QUANT, rounding=ROUND_DOWN)
 
 # ============================================================
-# 连接池
+# 连接池（只在 main.py 启动时调用一次）
 # ============================================================
 
 async def get_db_pool():
@@ -128,37 +137,85 @@ async def get_user_balance(pool, tg_id: int) -> Decimal:
             return Decimal(str(user["balance"]))
 
 
+async def credit_user_balance(pool, tg_id: int, amount: Decimal) -> None:
+    """充值到账：增加用户余额（使用订单基础金额 amount，不含随机尾数）。"""
+    amount_str = str(normalize_amount(amount))
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "SELECT tg_id FROM users WHERE tg_id = %s", (tg_id,)
+            )
+            if not await cur.fetchone():
+                await cur.execute(
+                    "INSERT INTO users (tg_id, balance) VALUES (%s, %s)",
+                    (tg_id, amount_str),
+                )
+                return
+            await cur.execute(
+                "UPDATE users SET balance = balance + %s WHERE tg_id = %s",
+                (amount_str, tg_id),
+            )
+
+
 # ============================================================
-# 订单 — 创建
+# 订单 — 创建（唯一金额 + 过期时间）
 # ============================================================
+
+async def pending_amount_exists(pool, final_amount: Decimal) -> bool:
+    """status='pending' 且未过期的金额唯一性预检（与 uk_final_amount 双保险）。"""
+    amount_str = str(normalize_amount(final_amount))
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                SELECT 1 FROM recharge_orders
+                WHERE status = 'pending'
+                  AND expires_at > NOW()
+                  AND ABS(final_amount - %s) < 0.000001
+                LIMIT 1
+                """,
+                (amount_str,),
+            )
+            return await cur.fetchone() is not None
+
 
 async def create_order(
     pool,
     user_tg_id: int,
-    product_id: int,
     base_amount: Decimal,
     final_amount: Decimal,
+    *,
+    order_type: str = "purchase",
+    product_id: int | None = None,
     expire_minutes: int = 30,
 ) -> int | None:
     """
-    写入 recharge_orders。
-    final_amount UNIQUE 冲突 → 返回 None，调用方重试。
-    fulfillment_status 初始为 'pending'（未开始提货）。
+    写入 recharge_orders（DECIMAL(20,6)）。
+    插入前再次 pending 预检；final_amount UNIQUE 冲突返回 None。
     """
+    base_str = str(normalize_amount(base_amount))
+    final_str = str(normalize_amount(final_amount))
+
+    if await pending_amount_exists(pool, final_amount):
+        return None
+
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             try:
                 await cur.execute(
                     """
                     INSERT INTO recharge_orders
-                        (user_id, product_id, amount, final_amount,
-                         status, fulfillment_status, expires_at)
-                    VALUES (%s, %s, %s, %s, 'pending', 'pending',
+                        (user_id, product_id, order_type, amount, final_amount,
+                         status, expires_at)
+                    VALUES (%s, %s, %s, %s, %s, 'pending',
                             DATE_ADD(NOW(), INTERVAL %s MINUTE))
                     """,
                     (
-                        user_tg_id, product_id,
-                        str(base_amount), str(final_amount),
+                        user_tg_id,
+                        product_id,
+                        order_type,
+                        base_str,
+                        final_str,
                         expire_minutes,
                     ),
                 )
@@ -167,22 +224,41 @@ async def create_order(
                 return None
 
 
-# ============================================================
-# 订单 — 核销
-# ============================================================
-
-async def find_pending_order_by_amount(pool, usdt_amount: Decimal) -> dict | None:
-    """
-    精确匹配未过期 pending 订单。
-    精度阈值 < 0.000001（等价于整数比较，USDT 链上 6 位小数）。
-    同时排除 expires_at <= NOW() 的订单，过期金额不核销。
-    """
-    amount_str = str(usdt_amount.quantize(Decimal("0.000001")))
+async def get_order_by_id(pool, order_id: int) -> dict | None:
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(
                 """
-                SELECT id, user_id, product_id, amount, final_amount
+                SELECT id, user_id, product_id, order_type, amount, final_amount, status
+                FROM recharge_orders WHERE id = %s
+                """,
+                (order_id,),
+            )
+            return await cur.fetchone()
+
+
+# ============================================================
+# 订单 — 核销（监听器使用）
+# ============================================================
+
+async def find_pending_order_by_amount(pool, usdt_amount: Decimal) -> dict | None:
+    """
+    按 final_amount 精确匹配"未过期的 pending"订单。
+
+    精度策略：
+      - USDT TRC20 链上精度 6 位，我们存 DECIMAL(20,6)
+      - 用 ABS(final_amount - X) < 0.000001 做精确比对（等价于整数比较）
+      - 不接受模糊匹配，避免误核销
+
+    同时过滤 expires_at > NOW()，确保已超时的金额坑位不会被匹配。
+    """
+    # 先把链上金额截断到 6 位小数，再转字符串传参
+    amount_str = str(normalize_amount(usdt_amount))
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                """
+                SELECT id, user_id, product_id, order_type, amount, final_amount
                 FROM recharge_orders
                 WHERE status = 'pending'
                   AND expires_at > NOW()
@@ -196,7 +272,10 @@ async def find_pending_order_by_amount(pool, usdt_amount: Decimal) -> dict | Non
 
 
 async def mark_order_paid(pool, order_id: int, tx_hash: str) -> bool:
-    """乐观锁：仅 status='pending' 时成功，防二次触发。"""
+    """
+    乐观锁更新：仅当 status='pending' 时才成功，
+    防止监听器在同一笔 tx 上二次触发。
+    """
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -219,59 +298,35 @@ async def mark_order_fulfilled(pool, order_id: int):
             )
 
 
-async def expire_stale_orders(pool) -> int:
-    """将 expires_at 已过的 pending 订单标记为 expired，释放坑位。"""
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                """
-                UPDATE recharge_orders
-                SET status = 'expired'
-                WHERE status = 'pending' AND expires_at <= NOW()
-                """
-            )
-            expired = cur.rowcount
-    if expired:
-        logger.info("清理过期订单: %d 条", expired)
-    return expired
-
-
-# ============================================================
-# 订单 — fulfillment_status（提货状态独立字段）
-# ============================================================
-
-async def set_fulfillment_status(pool, order_id: int, status: str):
+async def expire_stale_orders(pool) -> list[Decimal]:
     """
-    单独更新提货状态，与支付状态解耦。
-    status 取值：pending / processing / success / failed
+    将 expires_at 已过、仍处于 pending 的订单标记为 expired。
+    返回被过期订单的 final_amount 列表，供释放 Redis 锁。
     """
-    async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                "UPDATE recharge_orders SET fulfillment_status = %s WHERE id = %s",
-                (status, order_id),
-            )
-
-
-async def get_failed_fulfillment_orders(pool, limit: int = 20) -> list:
-    """查询发货失败的订单，供管理员面板展示。"""
+    amounts: list[Decimal] = []
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(
                 """
-                SELECT r.id, r.user_id, r.product_id, r.final_amount,
-                       r.paid_at, p.remote_name, p.display_name,
-                       d.error_msg
-                FROM recharge_orders r
-                LEFT JOIN products p ON p.id = r.product_id
-                LEFT JOIN delivery_records d ON d.order_id = r.id
-                WHERE r.fulfillment_status = 'failed'
-                ORDER BY r.paid_at DESC
-                LIMIT %s
-                """,
-                (limit,),
+                SELECT final_amount FROM recharge_orders
+                WHERE status = 'pending' AND expires_at <= NOW()
+                """
             )
-            return await cur.fetchall()
+            rows = await cur.fetchall()
+            amounts = [Decimal(str(r["final_amount"])) for r in rows]
+            if not amounts:
+                return []
+            await cur.execute(
+                """
+                UPDATE recharge_orders
+                SET status = 'expired'
+                WHERE status = 'pending'
+                  AND expires_at <= NOW()
+                """
+            )
+    if amounts:
+        logger.info("清理过期订单: %d 条", len(amounts))
+    return amounts
 
 
 # ============================================================
@@ -279,7 +334,10 @@ async def get_failed_fulfillment_orders(pool, limit: int = 20) -> list:
 # ============================================================
 
 async def get_processed_tx_hashes(pool) -> list[str]:
-    """加载近 7 天 tx_hash，防重启后重复核销，避免全表扫描。"""
+    """
+    启动时加载近 7 天的已处理 tx_hash 到内存，
+    防止重启后重复核销，同时避免全表扫描。
+    """
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -290,14 +348,21 @@ async def get_processed_tx_hashes(pool) -> list[str]:
             return [r[0] for r in rows]
 
 
-async def record_tx_hash(pool, tx_hash: str, order_id: int | None, amount: Decimal):
-    """记录链上交易，INSERT IGNORE 保证幂等。"""
+async def record_tx_hash(
+    pool,
+    tx_hash: str,
+    order_id: int | None,
+    amount: Decimal,
+):
+    """记录链上交易，无论是否匹配订单，INSERT IGNORE 保证幂等。"""
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             try:
                 await cur.execute(
-                    "INSERT IGNORE INTO tx_records (tx_hash, order_id, amount) "
-                    "VALUES (%s, %s, %s)",
+                    """
+                    INSERT IGNORE INTO tx_records (tx_hash, order_id, amount)
+                    VALUES (%s, %s, %s)
+                    """,
                     (tx_hash, order_id, str(amount)),
                 )
             except Exception as e:
