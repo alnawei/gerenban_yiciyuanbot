@@ -1,6 +1,11 @@
 """
-database.py
-数据库操作封装 — 包含 Phase 1 全量 + Phase 2 新增函数。
+database.py — 完整版，修复所有已知问题
+修复点：
+  - find_pending_order_by_amount 过滤已过期订单
+  - expire_stale_orders 改用 expires_at 字段（精确到分钟）
+  - create_order 写入 expires_at
+  - DECIMAL(20,6) 统一精度，金额全程字符串传参
+  - get_processed_tx_hashes 只加载近 7 天记录，防内存溢出
 """
 
 import logging
@@ -11,7 +16,7 @@ from config import DB_CONFIG
 logger = logging.getLogger(__name__)
 
 # ============================================================
-# 连接池
+# 连接池（只在 main.py 启动时调用一次）
 # ============================================================
 
 async def get_db_pool():
@@ -55,13 +60,10 @@ async def save_remote_products(pool, categories: list) -> int:
                     VALUES (%s, %s, %s, %s, 1)
                     ON DUPLICATE KEY UPDATE remote_name=%s, last_sync_price=%s
                     """
-                    await cur.execute(
-                        sql,
-                        (
-                            item["code"], item["name"], cat_name, item["price"],
-                            item["name"], item["price"],
-                        ),
-                    )
+                    await cur.execute(sql, (
+                        item["code"], item["name"], cat_name, str(item["price"]),
+                        item["name"], str(item["price"]),
+                    ))
                     count += 1
     return count
 
@@ -79,7 +81,8 @@ async def get_product_by_id(pool, product_id: int) -> dict | None:
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(
-                "SELECT id, remote_code, remote_name, display_name, price FROM products WHERE id=%s",
+                "SELECT id, remote_code, remote_name, display_name, price "
+                "FROM products WHERE id=%s",
                 (product_id,),
             )
             return await cur.fetchone()
@@ -108,7 +111,7 @@ async def get_user_data(pool, tg_id: int) -> dict:
                 await cur.execute(
                     "INSERT INTO users (tg_id, balance) VALUES (%s, 0)", (tg_id,)
                 )
-                return {"balance": 0.0}
+                return {"balance": Decimal("0")}
             return user
 
 
@@ -126,7 +129,7 @@ async def get_user_balance(pool, tg_id: int) -> Decimal:
 
 
 # ============================================================
-# 订单 — Phase 1：创建订单（下单入口）
+# 订单 — 创建（唯一金额 + 过期时间）
 # ============================================================
 
 async def create_order(
@@ -135,10 +138,14 @@ async def create_order(
     product_id: int,
     base_amount: Decimal,
     final_amount: Decimal,
+    expire_minutes: int = 30,
 ) -> int | None:
     """
-    写入 recharge_orders，final_amount 有 UNIQUE 约束，
-    冲突时返回 None（调用方需重新生成随机小数重试）。
+    写入 recharge_orders。
+    final_amount 有 UNIQUE 约束：冲突时 IntegrityError → 返回 None，
+    调用方重新生成随机小数后重试。
+    expires_at = NOW() + expire_minutes，到期后订单资源自动释放。
+    金额统一用字符串传入，避免浮点精度丢失。
     """
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
@@ -146,25 +153,41 @@ async def create_order(
                 await cur.execute(
                     """
                     INSERT INTO recharge_orders
-                        (user_id, product_id, amount, final_amount, status)
-                    VALUES (%s, %s, %s, %s, 'pending')
+                        (user_id, product_id, amount, final_amount, status, expires_at)
+                    VALUES (%s, %s, %s, %s, 'pending',
+                            DATE_ADD(NOW(), INTERVAL %s MINUTE))
                     """,
-                    (user_tg_id, product_id, base_amount, final_amount),
+                    (
+                        user_tg_id,
+                        product_id,
+                        str(base_amount),
+                        str(final_amount),
+                        expire_minutes,
+                    ),
                 )
                 return cur.lastrowid
             except aiomysql.IntegrityError:
-                return None  # final_amount 冲突，调用方重试
+                # final_amount 唯一索引冲突，返回 None 触发重试
+                return None
 
 
 # ============================================================
-# 订单 — Phase 2：核销相关
+# 订单 — 核销（监听器使用）
 # ============================================================
 
 async def find_pending_order_by_amount(pool, usdt_amount: Decimal) -> dict | None:
     """
-    按 final_amount 精确匹配未支付订单。
-    允许 ±0.001 的浮点误差（链上金额有时末位有细微偏差）。
+    按 final_amount 精确匹配"未过期的 pending"订单。
+
+    精度策略：
+      - USDT TRC20 链上精度 6 位，我们存 DECIMAL(20,6)
+      - 用 ABS(final_amount - X) < 0.000001 做精确比对（等价于整数比较）
+      - 不接受模糊匹配，避免误核销
+
+    同时过滤 expires_at > NOW()，确保已超时的金额坑位不会被匹配。
     """
+    # 先把链上金额截断到 6 位小数，再转字符串传参
+    amount_str = str(usdt_amount.quantize(Decimal("0.000001")))
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(
@@ -172,20 +195,20 @@ async def find_pending_order_by_amount(pool, usdt_amount: Decimal) -> dict | Non
                 SELECT id, user_id, product_id, amount, final_amount
                 FROM recharge_orders
                 WHERE status = 'pending'
-                  AND ABS(final_amount - %s) < 0.001
+                  AND expires_at > NOW()
+                  AND ABS(final_amount - %s) < 0.000001
                 ORDER BY created_at ASC
                 LIMIT 1
                 """,
-                (str(usdt_amount),),
+                (amount_str,),
             )
             return await cur.fetchone()
 
 
 async def mark_order_paid(pool, order_id: int, tx_hash: str) -> bool:
     """
-    将订单状态改为 paid，同时写入 tx_hash。
-    使用乐观锁防止重复核销（仅当 status='pending' 时才更新）。
-    返回 True 表示成功更新。
+    乐观锁更新：仅当 status='pending' 时才成功，
+    防止监听器在同一笔 tx 上二次触发。
     """
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
@@ -201,7 +224,6 @@ async def mark_order_paid(pool, order_id: int, tx_hash: str) -> bool:
 
 
 async def mark_order_fulfilled(pool, order_id: int):
-    """提货成功后将订单标记为 fulfilled"""
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -210,8 +232,12 @@ async def mark_order_fulfilled(pool, order_id: int):
             )
 
 
-async def expire_stale_orders(pool, hours: int = 2):
-    """将超时未支付的订单标记为 expired（定时任务调用）"""
+async def expire_stale_orders(pool) -> int:
+    """
+    将 expires_at 已过、仍处于 pending 的订单标记为 expired。
+    释放 final_amount 唯一索引坑位，供后续订单使用。
+    由定时任务每 5 分钟调用一次。
+    """
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
@@ -219,25 +245,30 @@ async def expire_stale_orders(pool, hours: int = 2):
                 UPDATE recharge_orders
                 SET status = 'expired'
                 WHERE status = 'pending'
-                  AND created_at < NOW() - INTERVAL %s HOUR
-                """,
-                (hours,),
+                  AND expires_at <= NOW()
+                """
             )
             expired = cur.rowcount
     if expired:
-        logger.info("已过期订单: %d 条", expired)
+        logger.info("清理过期订单: %d 条", expired)
     return expired
 
 
 # ============================================================
-# 交易哈希记录（去重）
+# 交易哈希去重
 # ============================================================
 
 async def get_processed_tx_hashes(pool) -> list[str]:
-    """启动时加载已处理的 tx_hash，防止重启后重复核销"""
+    """
+    启动时加载近 7 天的已处理 tx_hash 到内存，
+    防止重启后重复核销，同时避免全表扫描。
+    """
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
-            await cur.execute("SELECT tx_hash FROM tx_records")
+            await cur.execute(
+                "SELECT tx_hash FROM tx_records "
+                "WHERE created_at >= NOW() - INTERVAL 7 DAY"
+            )
             rows = await cur.fetchall()
             return [r[0] for r in rows]
 
@@ -248,7 +279,7 @@ async def record_tx_hash(
     order_id: int | None,
     amount: Decimal,
 ):
-    """记录链上交易，无论是否匹配订单"""
+    """记录链上交易，无论是否匹配订单，INSERT IGNORE 保证幂等。"""
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             try:
@@ -260,7 +291,7 @@ async def record_tx_hash(
                     (tx_hash, order_id, str(amount)),
                 )
             except Exception as e:
-                logger.warning("记录 tx_hash 失败: %s", e)
+                logger.warning("record_tx_hash 失败: %s", e)
 
 
 # ============================================================
@@ -283,8 +314,8 @@ async def save_delivery_record(
                     (order_id, product_id, status, content, error_msg)
                 VALUES (%s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
-                    status = VALUES(status),
-                    content = VALUES(content),
+                    status    = VALUES(status),
+                    content   = VALUES(content),
                     error_msg = VALUES(error_msg)
                 """,
                 (order_id, product_id, status, content, error_msg),

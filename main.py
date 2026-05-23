@@ -20,7 +20,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 # 自定义模块
 from config import (
     BOT_TOKEN, ADMIN_ID, REDIS_URL,
-    USDT_WALLET, TRONGRID_API_KEY, TRON_POLL_INTERVAL, ORDER_EXPIRE_HOURS,
+    USDT_WALLET, TRONGRID_API_KEY, TRON_POLL_INTERVAL, ORDER_EXPIRE_MINUTES,
 )
 from database import (
     get_db_pool, get_system_config, update_system_config,
@@ -487,7 +487,12 @@ async def back_to_shop(callback: types.CallbackQuery, db_pool):
 @dp.callback_query(F.data.startswith("buy_"))
 async def buy_product(callback: types.CallbackQuery, db_pool):
     """
-    用户点击商品 → 生成附随机小数的唯一金额 → 展示付款二维码/地址
+    用户点击商品 → 生成附随机小数的唯一 final_amount → 展示付款地址。
+
+    防冲突策略：
+      - 随机从 1~99 中不重复抽取 offset，最多尝试 20 次
+      - final_amount UNIQUE 约束由数据库保证
+      - 订单 30 分钟后过期，坑位自动释放
     """
     p_id = int(callback.data.replace("buy_", ""))
     user_tg_id = callback.from_user.id
@@ -500,27 +505,42 @@ async def buy_product(callback: types.CallbackQuery, db_pool):
     if not price:
         return await callback.answer("❌ 该商品尚未设置价格，请联系客服", show_alert=True)
 
-    base_amount = Decimal(str(price))
+    base_amount = Decimal(str(price)).quantize(Decimal("0.01"), rounding=ROUND_DOWN)
 
-    # ---- 生成防冲突 final_amount（最多重试 10 次）----
-    order_id = None
-    final_amount = None
-    for _ in range(10):
-        offset = Decimal(random.randint(1, 99)) / Decimal("100")  # 0.01 ~ 0.99
-        candidate = (base_amount + offset).quantize(Decimal("0.01"))
-        order_id = await create_order(db_pool, user_tg_id, p_id, base_amount, candidate)
-        if order_id:
-            final_amount = candidate
+    # ── 生成唯一 final_amount，不重复抽取 offset 直到成功 ───────────
+    order_id:       int | None     = None
+    final_amount:   Decimal | None = None
+    tried_offsets:  set[int]       = set()
+
+    for _ in range(20):
+        remaining = set(range(1, 100)) - tried_offsets
+        if not remaining:
+            break
+        offset_int = random.choice(list(remaining))
+        tried_offsets.add(offset_int)
+
+        candidate = (base_amount + Decimal(offset_int) / Decimal("100")).quantize(
+            Decimal("0.01")
+        )
+        result = await create_order(
+            db_pool, user_tg_id, p_id, base_amount, candidate,
+            expire_minutes=ORDER_EXPIRE_MINUTES,
+        )
+        if result:
+            order_id, final_amount = result, candidate
             break
 
     if not order_id:
-        logger.error("无法为用户 %d 创建唯一订单", user_tg_id)
-        return await callback.answer("⚠️ 系统繁忙，请稍后再试", show_alert=True)
+        logger.error(
+            "用户 %d 下单失败：base=%s，已试 %d 个 offset，全部冲突",
+            user_tg_id, base_amount, len(tried_offsets),
+        )
+        return await callback.answer(
+            "⚠️ 当前价格档位已满，请稍后重试或联系客服", show_alert=True
+        )
 
-    product_name = product.get("display_name") or product.get("remote_name")
-
-    # ---- 构建付款提示消息 ----
-    config = await get_system_config(db_pool)
+    product_name     = product.get("display_name") or product.get("remote_name")
+    config           = await get_system_config(db_pool)
     customer_service = config.get("customer_service", "")
 
     builder = InlineKeyboardBuilder()
@@ -535,19 +555,20 @@ async def buy_product(callback: types.CallbackQuery, db_pool):
     builder.adjust(1)
 
     pay_text = (
-        f"🛒 *下单成功，等待付款*\n\n"
+        f"🛒 *下单成功，请在 {ORDER_EXPIRE_MINUTES} 分钟内完成付款*\n\n"
         f"📦 商品：{product_name}\n"
         f"📋 订单号：`#{order_id}`\n\n"
         f"━━━━━━━━━━━━━━\n"
-        f"💳 *请向以下地址转账*\n\n"
-        f"网络：*TRC20 (TRON)*\n"
-        f"币种：*USDT*\n\n"
-        f"收款地址：\n`{USDT_WALLET}`\n\n"
-        f"⚠️ *必须转入精确金额*：\n"
-        f"# `{final_amount} USDT` #\n\n"
+        f"💳 *转账信息*\n\n"
+        f"  网络：`TRC20 (TRON)`\n"
+        f"  币种：`USDT`\n\n"
+        f"  收款地址：\n"
+        f"  `{USDT_WALLET}`\n\n"
+        f"  ⚠️ *必须转入精确金额*：\n"
+        f"  # `{final_amount} USDT` #\n\n"
         f"━━━━━━━━━━━━━━\n"
-        f"系统将在转账确认后 *自动发货*。\n"
-        f"订单有效期 *{2} 小时*，超时自动关闭。"
+        f"转账后系统将 *自动核销发货*，无需手动通知。\n"
+        f"⏰ 订单有效期 *{ORDER_EXPIRE_MINUTES} 分钟*，超时自动关闭。"
     )
 
     await callback.message.answer(pay_text, reply_markup=builder.as_markup(), parse_mode="Markdown")
@@ -603,11 +624,11 @@ async def auto_sync_task(db_pool):
 
 
 async def order_expire_task(db_pool):
-    """每 5 分钟清理过期订单"""
+    """每 5 分钟清理 expires_at 已过的 pending 订单，释放 final_amount 坑位"""
     while True:
         await asyncio.sleep(300)
         try:
-            await expire_stale_orders(db_pool, hours=2)
+            await expire_stale_orders(db_pool)
         except Exception as e:
             logger.error("过期订单清理异常: %s", e)
 
