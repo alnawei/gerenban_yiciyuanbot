@@ -1,15 +1,15 @@
 # config.py — 所有配置集中在此，不在任何其他文件硬编码
 
 # ── Telegram ─────────────────────────────────────────────────
-BOT_TOKEN = "8605092149:AAGHNPASj2o7qVslXzhH67-mSHOZuKerhZA"
-ADMIN_ID  = 5423107259  # 管理员 TG 数字 ID
+BOT_TOKEN = "AAGHNPASj2o7qVslXzhH67-mSHOZuKerhZA"
+ADMIN_ID  = 123456  # 管理员 TG 数字 ID
 
 # ── 数据库（1Panel 默认） ──────────────────────────────────────
 DB_CONFIG = {
     "host":    "127.0.0.1",
     "port":    3306,
     "user":    "tg_bot_db",
-    "password":"CTRWnyzbHxcWaNip",
+    "password":"password",
     "db":      "tg_bot_db",
     "charset": "utf8mb4",
     # 连接池参数（防止连接数爆炸）
