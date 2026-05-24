@@ -9,6 +9,7 @@ import contextlib
 import logging
 import time
 import uuid
+import html  # 【新增导入】：用于对动态名字执行 HTML 字符安全转义
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Awaitable, Callable
 
@@ -585,13 +586,13 @@ async def cb_toggle_cat_status(callback: types.CallbackQuery, db_pool):
 
 # main.py — 重构后的商品列表页面（一行一个商品）
 
+# main.py — 物理防崩溃重构版（请完全替换原有函数）
+
 @dp.callback_query(F.data.startswith("ashelf_cat_"), F.from_user.id == ADMIN_ID)
 async def admin_on_shelf(callback: types.CallbackQuery, db_pool):
     """
     展示某个分类下的全部商品。
-    重构亮点：
-      - 每个商品采用独占一行的全宽按钮：[状态] 名字 - 价格。
-      - 点击商品行后，弹出精致的专属控制台面板，杜绝密密麻麻的小按钮。
+    重构点：使用 HTML 与 html.escape 防御分类名特殊字符带来的页面崩溃。
     """
     cat_name = callback.data.replace("ashelf_cat_", "")
     async with db_pool.acquire() as conn:
@@ -619,13 +620,10 @@ async def admin_on_shelf(callback: types.CallbackQuery, db_pool):
         except EmptyStringError:
             continue
         
-        # 校验商品双重开启状态
         is_actually_on_shelf = (p["is_active"] == 1 and p.get("cat_active", 1) == 1)
         status_icon = "✅" if is_actually_on_shelf else "❌"
-        
         price_str = f"{p['price']} USDT" if p.get("price") else "面议"
         
-        # 商品行全宽显示，不再压缩，点击进入编辑调控台
         builder.row(types.InlineKeyboardButton(
             text=f"[{status_icon}] {actual_name} — {price_str}",
             callback_data=f"edit_opt_{p['id']}"
@@ -633,13 +631,15 @@ async def admin_on_shelf(callback: types.CallbackQuery, db_pool):
 
     builder.row(types.InlineKeyboardButton(text="⬅️ 返回分类列表", callback_data="admin_manage_goods"))
 
+    # 安全转义分类名称
+    safe_cat_name = html.escape(cat_name)
     timestamp = time.strftime("%H:%M:%S")
     await callback.message.edit_text(
-        f"🛠 **管理分类商品**：{cat_name}\n\n"
-        f"提示：点击任何一个商品行，即可进入其专属的 **`[修改名字 / 设置价格 / 下架停用]`** 专属中控台面板。\n"
-        f"_(同步刷新时间: {timestamp})_",
+        f"🛠 <b>管理分类商品</b>：{safe_cat_name}\n\n"
+        f"提示：点击任何一个商品行，即可进入其专属的 <b>[修改名字 / 设置价格 / 下架停用]</b> 专属中控台面板。\n"
+        f"<i>(同步刷新时间: {timestamp})</i>",
         reply_markup=builder.as_markup(),
-        parse_mode="Markdown",
+        parse_mode="HTML",
     )
 
 
@@ -715,13 +715,11 @@ async def cb_confirm_reset_all_categories_execution(callback: types.CallbackQuer
 
 async def _render_edit_options(callback: types.CallbackQuery, db_pool, p_id: int):
     """
-    【新添底层渲染器】根据商品主键 ID 读取最新状态，并物理刷新当前的商品中控台。
-    
-    优势：
-      - 彻底解耦 callback.data 绑定，完美规避 Pydantic Frozen Model 的属性只读报错限制 [4]。
-      - 在一次请求中完成 SQL 重新统计、Markdown 文本编译、InlineKeyboard 重组并直接下发 edit_text。
+    【独立渲染器 - 物理防解析崩溃版】
+    重构点：
+      - 彻底废弃敏感的 Markdown，改用坚固的 HTML 模式。
+      - 引入 html.escape 对商品名和分类名进行转义，防止商品名中含 [ ]、_、*、< > 引起后台死锁。
     """
-    # 联表获取商品状态及其分类的开启状态
     async with db_pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute("""
@@ -740,35 +738,34 @@ async def _render_edit_options(callback: types.CallbackQuery, db_pool, p_id: int
     cat_active = p_full.get("cat_active", 1)
     cat_name = p_full["category_name"]
     
-    # 销售状态：只有分类开启且商品启用，才显示“销售中”
+    # 核心安全：对第三方输入的名字进行物理 HTML 转义，防止不合法 HTML 字符解析失败
+    safe_actual_name = html.escape(actual_name)
+    safe_cat_name = html.escape(cat_name)
+    
     is_actually_on_shelf = (is_active == 1 and cat_active == 1)
     status_emoji = "✅ 销售中" if is_actually_on_shelf else "❌ 未出售 (或分类已关闭)"
     price_display = f"{p_full['price']} USDT" if p_full.get("price") else "面议"
 
     builder = InlineKeyboardBuilder()
-    # 1. 核心操作：改价与改名并排
     builder.row(
         types.InlineKeyboardButton(text="💰 设置价格", callback_data=f"setprice_{p_id}"),
         types.InlineKeyboardButton(text="✏️ 修改名称", callback_data=f"rename_{p_id}")
     )
-    # 2. 状态切换：启用或停用商品。按钮文字随状态动态自适应变化
     toggle_text = "❌ 停用该商品" if is_active == 1 else "✅ 启用该商品"
     builder.row(types.InlineKeyboardButton(text=toggle_text, callback_data=f"t_{p_id}"))
-    # 3. 返回上一级商品列表
     builder.row(types.InlineKeyboardButton(text="⬅️ 返回商品列表", callback_data=f"ashelf_cat_{cat_name}"))
 
-    # 直接调用电报核心 API 执行物理无缝替换，达到即时视觉反馈效果
+    # 转义后使用 HTML 安全发送
     await callback.message.edit_text(
-        f"⚙️ **商品中控面板**\n\n"
-        f"📦 商品：`{actual_name}`\n"
-        f"📂 分类：`{cat_name}`\n"
-        f"💰 价格：`{price_display}`\n"
+        f"⚙️ <b>商品中控面板</b>\n\n"
+        f"📦 商品：<code>{safe_actual_name}</code>\n"
+        f"📂 分类：<code>{safe_cat_name}</code>\n"
+        f"💰 价格：<code>{price_display}</code>\n"
         f"📊 状态：{status_emoji}\n\n"
-        f"_(提示：只有分类状态正常，且此商品开启启用，普通用户浏览时方可进行选购。)_",
+        f"<i>(提示：只有分类状态正常，且此商品开启启用，普通用户浏览时方可进行选购。)</i>",
         reply_markup=builder.as_markup(),
-        parse_mode="Markdown"
+        parse_mode="HTML"
     )
-
 
 # main.py — 重构后的商品专属中控面板与控制开关
 
@@ -965,11 +962,6 @@ async def process_app_key(message: types.Message, state: FSMContext, db_pool):
     await message.answer("✅ 商铺配置已保存，可在管理员面板执行同步。")
 
 
-# main.py — 重构后的 cb_sync_now 函数
-
-# main.py — 修复 Markdown 解析 Bug 的 cb_sync_now 函数
-
-# main.py — 重构为 HTML 解析模式的 cb_sync_now 函数
 
 @dp.callback_query(F.data == "sync_now", F.from_user.id == ADMIN_ID)
 async def cb_sync_now(callback: types.CallbackQuery, db_pool):
@@ -994,6 +986,7 @@ async def cb_sync_now(callback: types.CallbackQuery, db_pool):
         return await callback.message.answer(f"❌ 同步失败（业务错误）：\n{e}")
     except Exception as e:
         logger.exception("同步流程发生未知异常")
+        # 移除 parse_mode="Markdown" 和包裹的反引号。最朴素的纯文本才是承载未知系统异常最安全的形式
         return await callback.message.answer(f"❌ 同步发生未知异常，请查看后台日志：\n{e}")
         
     # 【终极修改】：改用 <b> 粗体与 <code> 宽体标签，并以 HTML 模式发送，彻底杜绝转义字符崩溃
