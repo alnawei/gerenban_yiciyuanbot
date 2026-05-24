@@ -153,7 +153,14 @@ async def _sync_remote_products(db_pool) -> int:
     result = await api.get_items()
     if result.get("code") not in (0, 200, "0", "200"):
         raise YiCiyuanAPIError("/shared/commodity/items", result.get("msg", "同步失败"))
-    categories = result.get("data", {}).get("list", [])
+    # 找到 _sync_remote_products 函数内部
+    data_content = result.get("data", [])
+    if isinstance(data_content, list):
+        categories = data_content      # 这里必须缩进 4 个空格
+    elif isinstance(data_content, dict):
+        categories = data_content.get("list", []) # 这里必须缩进 4 个空格
+    else:
+        categories = []                # 这里必须缩进 4 个空格
     return await save_remote_products(db_pool, categories)
 
 
@@ -397,31 +404,68 @@ async def process_set_price(message: types.Message, state: FSMContext, db_pool):
 async def admin_manage_cats(callback: types.CallbackQuery, db_pool):
     async with db_pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
+            # 核心修改：从 categories 表直接读取，确保 ID 排序不乱跳
+            # 同时关联 products 表统计数量
             await cur.execute("""
-                SELECT category_name, COUNT(*) as total, SUM(is_active) as active_count
-                FROM products GROUP BY category_name
+                SELECT 
+                    c.id, 
+                    c.category_name, 
+                    c.is_active as cat_active,
+                    COUNT(p.id) as total, 
+                    SUM(CASE WHEN c.is_active = 1 AND p.is_active = 1 THEN 1 ELSE 0 END) as active_count
+                FROM categories c
+                LEFT JOIN products p ON c.category_name = p.category_name
+                GROUP BY c.id, c.category_name, c.is_active
+                ORDER BY c.id ASC
             """)
             cats = await cur.fetchall()
 
     builder = InlineKeyboardBuilder()
     for c in cats:
-        try:
-            cat_name = require_non_empty_text(c["category_name"], "category_name")
-        except EmptyStringError:
-            continue
-        active = c["active_count"] or 0
-        short_cat = (cat_name[:12] + "..") if len(cat_name) > 12 else cat_name
-        builder.button(text=f"📂 {short_cat} ({active}/{c['total']})", callback_data=f"ashelf_cat_{cat_name}")
+        cat_id = c["id"]
+        cat_name = c["category_name"]
+        
+        # 状态显示：分类是否上架
+        cat_status_emoji = "✅" if c.get("cat_active", 1) else "❌"
+        # 统计显示：(已上架商品数/总商品数)
+        stats = f"({c['active_count'] or 0}/{c['total']})"
+        
+        # 限制名称长度
+        display_name = (cat_name[:10] + "..") if len(cat_name) > 10 else cat_name
+        
+        # 第一列：点击名称进入商品管理
+        builder.button(text=f"📂 {display_name} {stats}", callback_data=f"ashelf_cat_{cat_name}")
+        # 第二列：点击 ✅/❌ 切换分类显示状态
+        builder.button(text=cat_status_emoji, callback_data=f"toggle_cat_status_{cat_id}")
+        # 第三列：点击 📝 重命名
         builder.button(text="📝 编辑", callback_data=f"rencat_{cat_name}")
 
-    builder.adjust(2)
+    # 关键：每行显示 3 个按钮
+    builder.adjust(3) 
     builder.row(types.InlineKeyboardButton(text="⬅️ 返回主菜单", callback_data="back_to_admin"))
 
     await callback.message.edit_text(
-        "📂 **分类管理面板**\n点击名称管理商品，点击右侧 📝 重命名",
+        "📂 **分类管理面板**\n\n1. 点击 **📂名称**：管理该分类下的商品\n2. 点击 **✅/❌**：一键上架/下架该分类\n3. 点击 **📝编辑**：修改分类名称",
         reply_markup=builder.as_markup(),
         parse_mode="Markdown",
     )
+
+@dp.callback_query(F.data.startswith("toggle_cat_status_"), F.from_user.id == ADMIN_ID)
+async def cb_toggle_cat_status(callback: types.CallbackQuery, db_pool):
+    cat_id = int(callback.data.split("_")[-1])
+    
+    async with db_pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            # 切换 is_active 状态 (0变1, 1变0)
+            await cur.execute(
+                "UPDATE categories SET is_active = 1 - IFNULL(is_active, 1) WHERE id = %s",
+                (cat_id,)
+            )
+            await conn.commit()
+    
+    await callback.answer("分类状态已更新")
+    # 刷新面板
+    await admin_manage_cats(callback, db_pool)
 
 
 @dp.callback_query(F.data.startswith("ashelf_cat_"), F.from_user.id == ADMIN_ID)
@@ -429,10 +473,16 @@ async def admin_on_shelf(callback: types.CallbackQuery, db_pool):
     cat_name = callback.data.replace("ashelf_cat_", "")
     async with db_pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(
-                "SELECT id, remote_name, display_name, is_active FROM products WHERE category_name=%s ORDER BY id ASC",
-                (cat_name,),
-            )
+            await cur.execute("""
+            SELECT 
+                p.*, 
+                c.is_active as cat_active 
+                FROM products p
+                JOIN categories c ON p.category_name = c.category_name
+                WHERE p.category_name = %s
+                ORDER BY p.id ASC
+                """,
+                (cat_name,))
             prods = await cur.fetchall()
 
     builder = InlineKeyboardBuilder()
@@ -445,7 +495,10 @@ async def admin_on_shelf(callback: types.CallbackQuery, db_pool):
         except EmptyStringError:
             continue
         short_name = (actual_name[:12] + "..") if len(actual_name) > 12 else actual_name
-        status_icon = "✅" if p["is_active"] == 1 else "❌"
+        # 逻辑：只有【分类开启】且【商品开启】时，才显示 ✅
+# 如果分类关了(p["cat_active"] == 0)，无论商品状态如何，图标都显示为 ❌
+        is_actually_on_shelf = (p["is_active"] == 1 and p.get("cat_active", 1) == 1)
+        status_icon = "✅" if is_actually_on_shelf else "❌"
         builder.button(text=f"📦 {short_name}", callback_data="none")
         builder.button(text=status_icon, callback_data=f"t_{p['id']}")
         builder.button(text="⚙️ 编辑", callback_data=f"edit_opt_{p['id']}")
