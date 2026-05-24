@@ -1,6 +1,3 @@
--- Telegram retail bot initialization / migration SQL.
--- MySQL 8.x / MariaDB 10.6+ recommended.
-
 SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;
 SET time_zone = '+00:00';
 
@@ -20,7 +17,8 @@ CREATE TABLE IF NOT EXISTS categories (
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
-    UNIQUE KEY uk_categories_category_name (category_name)
+    UNIQUE KEY uk_categories_category_name (category_name),
+    KEY idx_categories_active (is_active)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS products (
@@ -38,11 +36,7 @@ CREATE TABLE IF NOT EXISTS products (
     PRIMARY KEY (id),
     UNIQUE KEY uk_products_remote_code (remote_code),
     KEY idx_products_category_active (category_name, is_active),
-    CONSTRAINT fk_products_category_name
-        FOREIGN KEY (category_name)
-        REFERENCES categories (category_name)
-        ON UPDATE CASCADE
-        ON DELETE RESTRICT,
+    KEY idx_products_active (is_active),
     CONSTRAINT chk_products_remote_code_nonempty CHECK (remote_code <> ''),
     CONSTRAINT chk_products_remote_name_nonempty CHECK (remote_name <> ''),
     CONSTRAINT chk_products_category_name_nonempty CHECK (category_name <> ''),
@@ -57,7 +51,8 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (tg_id)
+    PRIMARY KEY (tg_id),
+    KEY idx_users_tg_id (tg_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS recharge_orders (
@@ -76,15 +71,12 @@ CREATE TABLE IF NOT EXISTS recharge_orders (
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
+    KEY idx_orders_user_id (user_id),
+    KEY idx_orders_product_id (product_id),
     KEY idx_orders_user_status (user_id, status),
     KEY idx_orders_status_expires (status, expires_at),
     KEY idx_orders_final_amount (final_amount),
-    UNIQUE KEY uk_orders_tx_hash (tx_hash),
-    CONSTRAINT fk_orders_product
-        FOREIGN KEY (product_id)
-        REFERENCES products (id)
-        ON UPDATE CASCADE
-        ON DELETE SET NULL,
+    KEY idx_orders_tx_hash (tx_hash),
     CONSTRAINT chk_orders_tx_hash_nonempty CHECK (
         tx_hash IS NULL OR tx_hash <> ''
     )
@@ -98,13 +90,9 @@ CREATE TABLE IF NOT EXISTS tx_records (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     UNIQUE KEY uk_tx_records_tx_hash (tx_hash),
-    KEY idx_tx_records_created_at (created_at),
+    KEY idx_tx_records_tx_hash (tx_hash),
     KEY idx_tx_records_order_id (order_id),
-    CONSTRAINT fk_tx_records_order
-        FOREIGN KEY (order_id)
-        REFERENCES recharge_orders (id)
-        ON UPDATE CASCADE
-        ON DELETE SET NULL,
+    KEY idx_tx_records_created_at (created_at),
     CONSTRAINT chk_tx_records_tx_hash_nonempty CHECK (tx_hash <> '')
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
@@ -120,24 +108,11 @@ CREATE TABLE IF NOT EXISTS delivery_records (
         ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     UNIQUE KEY uk_delivery_order (order_id),
-    KEY idx_delivery_product (product_id),
-    CONSTRAINT fk_delivery_order
-        FOREIGN KEY (order_id)
-        REFERENCES recharge_orders (id)
-        ON UPDATE CASCADE
-        ON DELETE CASCADE,
-    CONSTRAINT fk_delivery_product
-        FOREIGN KEY (product_id)
-        REFERENCES products (id)
-        ON UPDATE CASCADE
-        ON DELETE RESTRICT
+    KEY idx_delivery_order_id (order_id),
+    KEY idx_delivery_product_id (product_id),
+    KEY idx_delivery_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 INSERT INTO system_config (config_key, config_value)
 VALUES ('tron_listener_min_ts', '0')
 ON DUPLICATE KEY UPDATE config_value = config_value;
-
-INSERT IGNORE INTO categories (category_name)
-SELECT DISTINCT category_name
-FROM products
-WHERE category_name IS NOT NULL AND category_name <> '';
