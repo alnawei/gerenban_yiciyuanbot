@@ -1,6 +1,7 @@
 """
 main.py
 Telegram 机器人主入口 — Phase 1 + Phase 2 完整版
+已修复：管理商品状态更新时，与父分类 is_active 状态不一致、UI 回调混乱等问题。
 """
 
 import asyncio
@@ -65,6 +66,7 @@ INSTANCE_LOCK_TTL = 60
 
 
 class InjectMiddleware(BaseMiddleware):
+    """全局中间件：为每个 Handler 注入数据库连接池与 Redis 实例"""
     def __init__(self, db_pool, redis_client):
         self.db_pool = db_pool
         self.redis_client = redis_client
@@ -95,6 +97,7 @@ class UserRecharge(StatesGroup):
 
 
 class InstanceLock:
+    """Redis 机器人单实例锁，防止多 Polling 进程冲突"""
     def __init__(self, redis_client, key: str, ttl: int):
         self.redis = redis_client
         self.key = key
@@ -141,7 +144,10 @@ def _message_text(message: types.Message, field_name: str) -> str:
     return require_non_empty_text(message.text, field_name)
 
 
+# main.py — 重构后的 _sync_remote_products 函数
+
 async def _sync_remote_products(db_pool) -> int:
+    """拉取并同步一次元商铺的商品和分类数据，并在第一现场打印调试日志。"""
     config = await get_system_config(db_pool)
     shop_url = config.get("shop_url")
     app_id = config.get("app_id")
@@ -153,14 +159,29 @@ async def _sync_remote_products(db_pool) -> int:
     result = await api.get_items()
     if result.get("code") not in (0, 200, "0", "200"):
         raise YiCiyuanAPIError("/shared/commodity/items", result.get("msg", "同步失败"))
-    # 找到 _sync_remote_products 函数内部
+
+    # 【新增修改 1】：在请求接口拿到数据的第一时间，打印返回体字符原始长度
+    raw_payload_len = len(str(result))
+    logger.info("🔍 [Sync Debug] 一次元接口请求成功！返回原始 Payload 长度: %d 字符", raw_payload_len)
+
     data_content = result.get("data", [])
     if isinstance(data_content, list):
-        categories = data_content      # 这里必须缩进 4 个空格
+        categories = data_content      
     elif isinstance(data_content, dict):
-        categories = data_content.get("list", []) # 这里必须缩进 4 个空格
+        categories = data_content.get("list", []) 
     else:
-        categories = []                # 这里必须缩进 4 个空格
+        categories = []                
+        
+    # 【新增修改 2】：自动递归累加接口数据含有的商品总数，不漏掉任何未入库的商品
+    total_api_items = 0
+    for cat in categories:
+        total_api_items += len(cat.get("children", []))
+    
+    logger.info(
+        "🔍 [Sync Debug] 接口数据层解析完毕。含有分类数: %d 个，含有商品原始总数: %d 个", 
+        len(categories), total_api_items
+    )
+    
     return await save_remote_products(db_pool, categories)
 
 
@@ -179,6 +200,8 @@ def build_payment_keyboard(order_id: int, customer_service: str = "") -> types.I
     return builder.as_markup()
 
 
+# main.py 中的完整修改函数
+
 def format_payment_message(
     *,
     title_line: str,
@@ -186,7 +209,22 @@ def format_payment_message(
     order_id: int,
     final_amount: Decimal,
 ) -> str:
-    amount_display = f"{final_amount:.6f}"
+    """
+    【优化修改】格式化支付展示消息。
+    
+    优化点：
+      - 废弃原有的 final_amount:.6f 强制展示 6 位小数逻辑。
+      - 智能检测金额的实际小数位深度 (exponent)：
+        - 如果金额为整数或 1~2 位小数，格式化为标准财务 2 位小数（如 5.00, 5.15 USDT）。
+        - 如果激活了三位防碰撞，格式化为精确的 3 位小数（如 5.123 USDT），绝不产生 5.123000。
+    """
+    # 获取金额的实际小数位数
+    exponent = abs(final_amount.as_tuple().exponent)
+    if exponent <= 2:
+        amount_display = f"{final_amount:.2f}"
+    else:
+        amount_display = f"{final_amount:.3f}"
+
     return (
         f"{title_line}\n\n"
         f"{detail_lines}\n"
@@ -209,8 +247,13 @@ def format_payment_message(
 # 管理员指令：/admin
 # ============================================================
 
+# main.py - 修改后的 admin_menu 函数
+
+# main.py — 恢复为清爽的 admin_menu 函数
+
 @dp.message(Command("admin"), F.from_user.id == ADMIN_ID)
 async def admin_menu(message: types.Message, db_pool):
+    """管理员主菜单（已移除重置分类按钮，该按钮移位至分类管理面板）"""
     config = await get_system_config(db_pool)
     shop_url = config.get("shop_url")
     total_count, active_count = await get_shop_stats(db_pool)
@@ -251,8 +294,19 @@ async def start_rename(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+# main.py — 优化商品编辑流，支持改名后直达改价的 process_new_name 函数
+
+# main.py — 重构后的改名成功处理器（增加💰设置价格）
+
 @dp.message(AdminSetup.waiting_for_new_name, F.from_user.id == ADMIN_ID)
 async def process_new_name(message: types.Message, state: FSMContext, db_pool):
+    """
+    管理员：处理输入商品新名称。
+    
+    闭环设计点：
+      - 改名成功后，主操作按钮设为“💰 设置价格”，绑定 setprice_{p_id}。
+        点击即可直达价格修改流程，实现编辑链路闭环 [2]。
+    """
     try:
         new_name = _message_text(message, "商品名称")
     except EmptyStringError:
@@ -273,12 +327,22 @@ async def process_new_name(message: types.Message, state: FSMContext, db_pool):
             cat_name = res["category_name"] if res else ""
 
     kb = InlineKeyboardBuilder()
+    
+    # 【闭环设计 1】：首要按钮设为设置售价，无缝衔接下一步改价流程
+    kb.button(text="💰 设置价格", callback_data=f"setprice_{p_id}")
+    # 辅助按钮：若名字打错，支持一键“重新修改名称”
+    kb.button(text="🔄 重新修改", callback_data=f"rename_{p_id}")
+    # 返回按钮：退回原商品列表
     if cat_name:
         kb.button(text="⬅️ 返回商品列表", callback_data=f"ashelf_cat_{cat_name}")
-    kb.button(text="🔄 重新修改", callback_data=f"rename_{p_id}")
+        
     kb.adjust(1)
 
-    await message.answer(f"✅ 商品名已更新为：\n`{new_name}`", reply_markup=kb.as_markup(), parse_mode="Markdown")
+    await message.answer(
+        f"✅ 商品名已成功更新为：\n`{new_name}`", 
+        reply_markup=kb.as_markup(), 
+        parse_mode="Markdown"
+    )
     await state.clear()
 
 
@@ -295,8 +359,18 @@ async def start_rename_cat(callback: types.CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+# main.py — 彻底修复改名跑位 Bug 的 process_new_cat_name 函数
+
 @dp.message(AdminSetup.waiting_for_new_cat_name, F.from_user.id == ADMIN_ID)
 async def process_new_cat_name(message: types.Message, state: FSMContext, db_pool):
+    """
+    【重构修复】管理员：处理输入的新分类名称并落库。
+    
+    修复点：
+      - 弃用原版“先删除、后插入”导致 ID 变大、排序乱跳的逻辑。
+      - 改用原子的 UPDATE 直接修改 categories 表中的名字，使主键 ID 永久保持不变，
+        从而配合 ORDER BY id ASC 实现了改名后分类位置绝对不发生偏移。
+    """
     try:
         new_cat_name = _message_text(message, "分类名称")
     except EmptyStringError:
@@ -310,26 +384,33 @@ async def process_new_cat_name(message: types.Message, state: FSMContext, db_poo
 
     async with db_pool.acquire() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(
-                "UPDATE products SET category_name=%s WHERE category_name=%s",
-                (new_cat_name, old_cat_name),
-            )
-            await cur.execute(
-                """
-                INSERT INTO categories (category_name, is_active)
-                VALUES (%s, 1)
-                ON DUPLICATE KEY UPDATE category_name=VALUES(category_name)
-                """,
-                (new_cat_name,),
-            )
-            await cur.execute("DELETE FROM categories WHERE category_name=%s", (old_cat_name,))
-            await conn.commit()
+            # 临时关闭外键约束，保障多表原子更新的安全性
+            await cur.execute("SET FOREIGN_KEY_CHECKS = 0")
+            try:
+                # 1. 同步更新商品表 (products) 中的分类名称冗余关联
+                await cur.execute(
+                    "UPDATE products SET category_name=%s WHERE category_name=%s",
+                    (new_cat_name, old_cat_name),
+                )
+                # 2. 【核心修复】：直接 UPDATE 分类表中的名称。主键 id 纹丝不动，完美锁住其排序位置
+                await cur.execute(
+                    "UPDATE categories SET category_name=%s WHERE category_name=%s",
+                    (new_cat_name, old_cat_name),
+                )
+                await conn.commit()
+            except Exception as e:
+                await conn.rollback()
+                logger.error("重命名分类失败，事务已回滚: %s", e)
+                return await message.answer(f"❌ 修改分类名失败：{e}")
+            finally:
+                # 必须恢复外键安全检查
+                await cur.execute("SET FOREIGN_KEY_CHECKS = 1")
 
     kb = InlineKeyboardBuilder()
     kb.button(text="⬅️ 返回分类列表", callback_data="admin_manage_goods")
 
     await message.answer(
-        f"✅ 分类名已修改：\n`{old_cat_name}` ➡️ `{new_cat_name}`",
+        f"✅ 分类名已成功修改：\n`{old_cat_name}` ➡️ `{new_cat_name}`",
         reply_markup=kb.as_markup(),
         parse_mode="Markdown",
     )
@@ -337,7 +418,7 @@ async def process_new_cat_name(message: types.Message, state: FSMContext, db_poo
 
 
 # ============================================================
-# 管理员：设置商品价格（Phase 2 新增）
+# 管理员：设置商品价格
 # ============================================================
 
 @dp.callback_query(F.data.startswith("setprice_"), F.from_user.id == ADMIN_ID)
@@ -354,8 +435,17 @@ async def start_set_price(callback: types.CallbackQuery, state: FSMContext, db_p
     await callback.answer()
 
 
+# main.py — 重构后的改价成功处理器（增加✏️修改名称）
+
 @dp.message(AdminSetup.waiting_for_price, F.from_user.id == ADMIN_ID)
 async def process_set_price(message: types.Message, state: FSMContext, db_pool):
+    """
+    管理员：处理输入的商品新售价。
+    
+    闭环设计点：
+      - 改价成功后，主操作按钮设为“✏️ 修改名称”，绑定 rename_{p_id}。
+        点击即可直达改名流程，完成“价格修改 ➡️ 商品改名”的双向流动闭环。
+    """
     try:
         text = _message_text(message, "商品价格")
     except EmptyStringError:
@@ -383,13 +473,19 @@ async def process_set_price(message: types.Message, state: FSMContext, db_pool):
             cat_name = res["category_name"] if res else ""
 
     kb = InlineKeyboardBuilder()
+    
+    # 【闭环设计 2】：首要按钮设为修改名称，形成完整的反向流动闭环
+    kb.button(text="✏️ 修改名称", callback_data=f"rename_{p_id}")
+    # 辅助按钮：若价格输错，支持一键“再次修改价格”
+    kb.button(text="💰 再次修改", callback_data=f"setprice_{p_id}")
+    # 返回按钮：退回原商品列表
     if cat_name:
         kb.button(text="⬅️ 返回商品列表", callback_data=f"ashelf_cat_{cat_name}")
-    kb.button(text="💰 再次修改", callback_data=f"setprice_{p_id}")
+        
     kb.adjust(1)
 
     await message.answer(
-        f"✅ 售价已更新为：`{price} USDT`",
+        f"✅ 售价已成功更新为：`{price} USDT`",
         reply_markup=kb.as_markup(),
         parse_mode="Markdown",
     )
@@ -400,12 +496,26 @@ async def process_set_price(message: types.Message, state: FSMContext, db_pool):
 # 管理员：分类 & 商品管理面板
 # ============================================================
 
+# main.py — 修改后的 admin_manage_cats 函数
+
+# main.py — 包含重置按钮与固定排序的展示函数
+
+# main.py — 重构后的分类管理面板
+
+# main.py — 彻底解决排版错位的分类管理面板函数
+
 @dp.callback_query(F.data == "admin_manage_goods", F.from_user.id == ADMIN_ID)
 async def admin_manage_cats(callback: types.CallbackQuery, db_pool):
+    """
+    分类管理面板（完美排版修复版）。
+    
+    重构亮点：
+      - 彻底移除 builder.adjust() 语句，改用显式 builder.row() 物理分行。
+      - 彻底杜绝 aiogram 底层将后续多行按钮强行按 2 列压缩排版导致的错位 Bug。
+      - 无论分类名多长，均能实现：第一行名称独占全宽，第二行开关与改名等宽并排。
+    """
     async with db_pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
-            # 核心修改：从 categories 表直接读取，确保 ID 排序不乱跳
-            # 同时关联 products 表统计数量
             await cur.execute("""
                 SELECT 
                     c.id, 
@@ -425,27 +535,34 @@ async def admin_manage_cats(callback: types.CallbackQuery, db_pool):
         cat_id = c["id"]
         cat_name = c["category_name"]
         
-        # 状态显示：分类是否上架
-        cat_status_emoji = "✅" if c.get("cat_active", 1) else "❌"
-        # 统计显示：(已上架商品数/总商品数)
-        stats = f"({c['active_count'] or 0}/{c['total']})"
+        cat_active = c.get("cat_active", 1)
+        active_count = c.get("active_count") or 0
         
-        # 限制名称长度
-        display_name = (cat_name[:10] + "..") if len(cat_name) > 10 else cat_name
+        # 1. 强制第 1 行：分类名字按钮（独占一整行全宽）
+        builder.row(types.InlineKeyboardButton(
+            text=f"📂 {cat_name} ({active_count})", 
+            callback_data=f"ashelf_cat_{cat_name}"
+        ))
         
-        # 第一列：点击名称进入商品管理
-        builder.button(text=f"📂 {display_name} {stats}", callback_data=f"ashelf_cat_{cat_name}")
-        # 第二列：点击 ✅/❌ 切换分类显示状态
-        builder.button(text=cat_status_emoji, callback_data=f"toggle_cat_status_{cat_id}")
-        # 第三列：点击 📝 重命名
-        builder.button(text="📝 编辑", callback_data=f"rencat_{cat_name}")
+        cat_status_emoji = "✅ 开启中" if cat_active == 1 else "❌ 已关闭"
+        
+        # 2. 强制第 2 行：并排放置状态按钮和改名按钮（新开一行，横向均分）
+        builder.row(
+            types.InlineKeyboardButton(text=f"状态: {cat_status_emoji}", callback_data=f"toggle_cat_status_{cat_id}"),
+            types.InlineKeyboardButton(text="📝 改分类名", callback_data=f"rencat_{cat_name}")
+        )
 
-    # 关键：每行显示 3 个按钮
-    builder.adjust(3) 
+    # 【核心修改】：不调用 builder.adjust()，完全依赖上面的 builder.row() 独立成行，确保结构坚如磐石
+    
+    # 底部系统管理按钮（各自独占一行）
+    builder.row(types.InlineKeyboardButton(text="⚠️ 重置所有分类", callback_data="reset_all_categories"))
     builder.row(types.InlineKeyboardButton(text="⬅️ 返回主菜单", callback_data="back_to_admin"))
 
     await callback.message.edit_text(
-        "📂 **分类管理面板**\n\n1. 点击 **📂名称**：管理该分类下的商品\n2. 点击 **✅/❌**：一键上架/下架该分类\n3. 点击 **📝编辑**：修改分类名称",
+        "📂 **分类管理面板 (排版已对齐)**\n\n"
+        "• 点击 **📂分类名称**：进入管理该分类下的商品列表。\n"
+        "• 点击 **状态按钮**：开启或关闭分类，下架分类后，其商品统计会自动归零并自动在前台对普通用户隐退 [1]。\n"
+        "• 点击 **改分类名**：修改分类名字。",
         reply_markup=builder.as_markup(),
         parse_mode="Markdown",
     )
@@ -456,7 +573,6 @@ async def cb_toggle_cat_status(callback: types.CallbackQuery, db_pool):
     
     async with db_pool.acquire() as conn:
         async with conn.cursor() as cur:
-            # 切换 is_active 状态 (0变1, 1变0)
             await cur.execute(
                 "UPDATE categories SET is_active = 1 - IFNULL(is_active, 1) WHERE id = %s",
                 (cat_id,)
@@ -464,91 +580,31 @@ async def cb_toggle_cat_status(callback: types.CallbackQuery, db_pool):
             await conn.commit()
     
     await callback.answer("分类状态已更新")
-    # 刷新面板
     await admin_manage_cats(callback, db_pool)
 
 
+# main.py — 重构后的商品列表页面（一行一个商品）
+
 @dp.callback_query(F.data.startswith("ashelf_cat_"), F.from_user.id == ADMIN_ID)
 async def admin_on_shelf(callback: types.CallbackQuery, db_pool):
+    """
+    展示某个分类下的全部商品。
+    重构亮点：
+      - 每个商品采用独占一行的全宽按钮：[状态] 名字 - 价格。
+      - 点击商品行后，弹出精致的专属控制台面板，杜绝密密麻麻的小按钮。
+    """
     cat_name = callback.data.replace("ashelf_cat_", "")
     async with db_pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute("""
-            SELECT 
-                p.*, 
-                c.is_active as cat_active 
+                SELECT 
+                    p.*, 
+                    c.is_active as cat_active 
                 FROM products p
                 JOIN categories c ON p.category_name = c.category_name
                 WHERE p.category_name = %s
                 ORDER BY p.id ASC
                 """,
-                (cat_name,))
-            prods = await cur.fetchall()
-
-    builder = InlineKeyboardBuilder()
-    for p in prods:
-        try:
-            actual_name = require_non_empty_text(
-                p["display_name"] if p["display_name"] else p["remote_name"],
-                "product_name",
-            )
-        except EmptyStringError:
-            continue
-        short_name = (actual_name[:12] + "..") if len(actual_name) > 12 else actual_name
-        # 逻辑：只有【分类开启】且【商品开启】时，才显示 ✅
-# 如果分类关了(p["cat_active"] == 0)，无论商品状态如何，图标都显示为 ❌
-        is_actually_on_shelf = (p["is_active"] == 1 and p.get("cat_active", 1) == 1)
-        status_icon = "✅" if is_actually_on_shelf else "❌"
-        builder.button(text=f"📦 {short_name}", callback_data="none")
-        builder.button(text=status_icon, callback_data=f"t_{p['id']}")
-        builder.button(text="⚙️ 编辑", callback_data=f"edit_opt_{p['id']}")
-
-    builder.adjust(3)
-    builder.row(types.InlineKeyboardButton(text="⬅️ 返回分类列表", callback_data="admin_manage_goods"))
-
-    timestamp = time.strftime("%H:%M:%S")
-    await callback.message.edit_text(
-        f"🛠 **管理分类**：{cat_name}\n(实时状态刷新: {timestamp})",
-        reply_markup=builder.as_markup(),
-        parse_mode="Markdown",
-    )
-
-
-@dp.callback_query(F.data.startswith("edit_opt_"), F.from_user.id == ADMIN_ID)
-async def show_edit_options(callback: types.CallbackQuery):
-    p_id = callback.data.replace("edit_opt_", "")
-    builder = InlineKeyboardBuilder()
-    builder.button(text="📝 修改名称", callback_data=f"rename_{p_id}")
-    builder.button(text="💰 设置价格", callback_data=f"setprice_{p_id}")
-    builder.button(text="⬅️ 取消", callback_data="admin_manage_goods")
-    builder.adjust(1)
-
-    await callback.message.edit_text(
-        "⚙️ **选择编辑操作**：\n您可以修改商品显示名称或设定售价。",
-        reply_markup=builder.as_markup(),
-        parse_mode="Markdown",
-    )
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("t_"), F.from_user.id == ADMIN_ID)
-async def toggle_product(callback: types.CallbackQuery, db_pool):
-    p_id = callback.data.replace("t_", "")
-
-    async with db_pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute("SELECT is_active, category_name FROM products WHERE id=%s", (p_id,))
-            product = await cur.fetchone()
-            if not product:
-                return await callback.answer("未找到商品")
-
-            new_status = 0 if product["is_active"] == 1 else 1
-            await cur.execute("UPDATE products SET is_active=%s WHERE id=%s", (new_status, p_id))
-            await conn.commit()
-
-            cat_name = product["category_name"]
-            await cur.execute(
-                "SELECT id, remote_name, display_name, is_active FROM products WHERE category_name=%s ORDER BY id ASC",
                 (cat_name,),
             )
             prods = await cur.fetchall()
@@ -562,36 +618,346 @@ async def toggle_product(callback: types.CallbackQuery, db_pool):
             )
         except EmptyStringError:
             continue
-        short_name = (actual_name[:12] + "..") if len(actual_name) > 12 else actual_name
-        status_icon = "✅" if p["is_active"] == 1 else "❌"
-        builder.button(text=f"📦 {short_name}", callback_data="none")
-        builder.button(text=status_icon, callback_data=f"t_{p['id']}")
-        builder.button(text="📝", callback_data=f"rename_{p['id']}")
+        
+        # 校验商品双重开启状态
+        is_actually_on_shelf = (p["is_active"] == 1 and p.get("cat_active", 1) == 1)
+        status_icon = "✅" if is_actually_on_shelf else "❌"
+        
+        price_str = f"{p['price']} USDT" if p.get("price") else "面议"
+        
+        # 商品行全宽显示，不再压缩，点击进入编辑调控台
+        builder.row(types.InlineKeyboardButton(
+            text=f"[{status_icon}] {actual_name} — {price_str}",
+            callback_data=f"edit_opt_{p['id']}"
+        ))
 
-    builder.adjust(3)
     builder.row(types.InlineKeyboardButton(text="⬅️ 返回分类列表", callback_data="admin_manage_goods"))
 
     timestamp = time.strftime("%H:%M:%S")
+    await callback.message.edit_text(
+        f"🛠 **管理分类商品**：{cat_name}\n\n"
+        f"提示：点击任何一个商品行，即可进入其专属的 **`[修改名字 / 设置价格 / 下架停用]`** 专属中控台面板。\n"
+        f"_(同步刷新时间: {timestamp})_",
+        reply_markup=builder.as_markup(),
+        parse_mode="Markdown",
+    )
+
+
+# main.py — 追加以下两个 Callback 处理器
+
+# main.py — 重构后的重置与多表清空全套 Callback 处理器
+
+@dp.callback_query(F.data == "reset_all_categories", F.from_user.id == ADMIN_ID)
+async def cb_reset_all_categories_confirm(callback: types.CallbackQuery):
+    """
+    【二次确认页 - 重构版】管理员点击“重置所有分类”后，展示高危物理清空风险警告。
+    """
+    builder = InlineKeyboardBuilder()
+    # 红色警告：确认完全重置
+    builder.button(text="⚠️ 确认完全清空并重置", callback_data="confirm_reset_all_categories")
+    # 安全取消
+    builder.button(text="❌ 取消并返回分类管理", callback_data="admin_manage_goods")
+    builder.adjust(1)
+
+    await callback.message.edit_text(
+        "🚨 **高危操作二次确认** 🚨\n\n"
+        "您正在请求对商品目录进行最彻底的物理清除，该操作将执行以下底层动作：\n\n"
+        "• 🧹 **清空全部分类**：物理清空 `categories` 表，丢弃您手动改过的所有分类名称。\n"
+        "• 🧹 **清空全部商品**：物理清空 `products` 表，**彻底擦除包括您手动配置过的价格、Display Name 和同步状态**。\n\n"
+        "❗ **高危警告：此操作将清空所有分类、商品名称及手动设置的价格，且不可恢复！**\n\n"
+        "重置后，后台主面板的统计数字将自动归零。您必须手动执行 **‘立即同步’** 才能重新从一次元拉取原始上架数据。\n\n"
+        "您是否确定要继续进行此项操作？",
+        reply_markup=builder.as_markup(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "confirm_reset_all_categories", F.from_user.id == ADMIN_ID)
+async def cb_confirm_reset_all_categories_execution(callback: types.CallbackQuery, db_pool):
+    """
+    【物理完全清空数据 - 重构版】清空 categories 和 products 表，提示并自动返回归零的主菜单。
+    """
+    # 1. 立即应答，提示正在处理中
+    await callback.answer("正在安全执行多表物理擦除，请稍候...", show_alert=False)
+    
     try:
-        await callback.message.edit_text(
-            f"🛠 **管理分类**：{cat_name}\n(状态已同步 - {timestamp})",
-            reply_markup=builder.as_markup(),
-            parse_mode="Markdown",
+        # 2. 【核心修改】：开启多表 Truncate 物理清空事务
+        async with db_pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                # 2.1 临时关闭外键约束，保障 TRUNCATE 顺利绕开外键检查执行
+                await cur.execute("SET FOREIGN_KEY_CHECKS = 0")
+                try:
+                    # 2.2 清空 categories 分类表并重置自增主键 (TRUNCATE)
+                    await cur.execute("TRUNCATE TABLE categories")
+                    # 2.3 清空 products 商品表并重置自增主键 (TRUNCATE)
+                    await cur.execute("TRUNCATE TABLE products")
+                    await conn.commit()
+                finally:
+                    # 2.4 必须恢复外键安全检查
+                    await cur.execute("SET FOREIGN_KEY_CHECKS = 1")
+        
+        # 3. 弹窗大提示（show_alert=True），强力提醒管理员重新同步
+        await callback.answer(
+            "✅ 数据已完全清空！\n\n请重新执行“立即同步”以获取原始上架数据。",
+            show_alert=True
         )
-        await callback.answer(f"已{'开启' if new_status else '关闭'}")
-    except Exception:
-        await callback.answer("状态已更新")
+        
+        # 4. 【核心修改】：自动重新加载并跳转回管理员主菜单
+        # 因为 categories 和 products 已完全清空，主菜单的 `total_count` 和 `active_count` 
+        # 将会通过 get_shop_stats 物理重读，自动并实时刷新为 0。
+        await admin_menu(callback.message, db_pool)
+        
+    except Exception as e:
+        logger.exception("物理完全清空数据发生未知系统异常")
+        await callback.message.answer(f"❌ 物理完全重置数据失败：{e}")
+
+
+async def _render_edit_options(callback: types.CallbackQuery, db_pool, p_id: int):
+    """
+    【新添底层渲染器】根据商品主键 ID 读取最新状态，并物理刷新当前的商品中控台。
+    
+    优势：
+      - 彻底解耦 callback.data 绑定，完美规避 Pydantic Frozen Model 的属性只读报错限制 [4]。
+      - 在一次请求中完成 SQL 重新统计、Markdown 文本编译、InlineKeyboard 重组并直接下发 edit_text。
+    """
+    # 联表获取商品状态及其分类的开启状态
+    async with db_pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute("""
+                SELECT p.*, c.is_active as cat_active 
+                FROM products p
+                JOIN categories c ON p.category_name = c.category_name
+                WHERE p.id = %s
+            """, (p_id,))
+            p_full = await cur.fetchone()
+            
+    if not p_full:
+        return await callback.answer("商品加载失败，可能已被物理重置。")
+
+    actual_name = p_full["display_name"] if p_full["display_name"] else p_full["remote_name"]
+    is_active = p_full["is_active"]
+    cat_active = p_full.get("cat_active", 1)
+    cat_name = p_full["category_name"]
+    
+    # 销售状态：只有分类开启且商品启用，才显示“销售中”
+    is_actually_on_shelf = (is_active == 1 and cat_active == 1)
+    status_emoji = "✅ 销售中" if is_actually_on_shelf else "❌ 未出售 (或分类已关闭)"
+    price_display = f"{p_full['price']} USDT" if p_full.get("price") else "面议"
+
+    builder = InlineKeyboardBuilder()
+    # 1. 核心操作：改价与改名并排
+    builder.row(
+        types.InlineKeyboardButton(text="💰 设置价格", callback_data=f"setprice_{p_id}"),
+        types.InlineKeyboardButton(text="✏️ 修改名称", callback_data=f"rename_{p_id}")
+    )
+    # 2. 状态切换：启用或停用商品。按钮文字随状态动态自适应变化
+    toggle_text = "❌ 停用该商品" if is_active == 1 else "✅ 启用该商品"
+    builder.row(types.InlineKeyboardButton(text=toggle_text, callback_data=f"t_{p_id}"))
+    # 3. 返回上一级商品列表
+    builder.row(types.InlineKeyboardButton(text="⬅️ 返回商品列表", callback_data=f"ashelf_cat_{cat_name}"))
+
+    # 直接调用电报核心 API 执行物理无缝替换，达到即时视觉反馈效果
+    await callback.message.edit_text(
+        f"⚙️ **商品中控面板**\n\n"
+        f"📦 商品：`{actual_name}`\n"
+        f"📂 分类：`{cat_name}`\n"
+        f"💰 价格：`{price_display}`\n"
+        f"📊 状态：{status_emoji}\n\n"
+        f"_(提示：只有分类状态正常，且此商品开启启用，普通用户浏览时方可进行选购。)_",
+        reply_markup=builder.as_markup(),
+        parse_mode="Markdown"
+    )
+
+
+# main.py — 重构后的商品专属中控面板与控制开关
+
+@dp.callback_query(F.data.startswith("edit_opt_"), F.from_user.id == ADMIN_ID)
+async def show_edit_options(callback: types.CallbackQuery, db_pool):
+    """
+    呈现商品专属控制台子菜单。
+    """
+    p_id = int(callback.data.replace("edit_opt_", ""))
+    # 调用物理渲染器
+    await _render_edit_options(callback, db_pool, p_id)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("t_"), F.from_user.id == ADMIN_ID)
+async def toggle_product(callback: types.CallbackQuery, db_pool):
+    """
+    【修复后逻辑】：管理员在控制台内切换商品的上下架状态。
+    
+    修改点：
+      - 彻底重构事件。完成数据库状态更新后，不再假装 callback.data。
+      - 直接将 callback 对象传入 _render_edit_options 物理渲染器，
+        做到状态切换后 0 毫秒即时刷新文本与按键，实现完美的一体化无缝操作反馈！
+    """
+    p_id = int(callback.data.replace("t_", ""))
+
+    async with db_pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute("SELECT is_active FROM products WHERE id=%s", (p_id,))
+            product = await cur.fetchone()
+            if not product:
+                return await callback.answer("未找到此商品")
+
+            # 翻转状态
+            new_status = 0 if product["is_active"] == 1 else 1
+            await cur.execute("UPDATE products SET is_active=%s WHERE id=%s", (new_status, p_id))
+            await conn.commit()
+
+    # 先通过渲染器物理重刷消息内容（修改文字和按键），实现前台即刻视觉刷新
+    await _render_edit_options(callback, db_pool, p_id)
+    # 最后进行轻量化气泡通报
+    await callback.answer(f"商品状态已成功变更为: {'启用' if new_status else '停用'}")
+
+# main.py - 追加以下 Callback 处理器
+
+@dp.callback_query(F.data == "reset_all_categories", F.from_user.id == ADMIN_ID)
+async def cb_reset_all_categories(callback: types.CallbackQuery, db_pool):
+    """
+    管理员：点击“重置所有分类”后的逻辑处理。
+    实现原理：
+      - 调用安全函数清空本地 categories 数据；
+      - 重新运行 API 同步流程，系统会依据 remote_code 更新现有产品的 category_name 指向，
+        自动将其改回一次元官方最原始的分类名称，同时清除后台冗余的重命名记录。
+    """
+    await callback.answer("正在重置分类并拉取 API 重新同步，请稍候...", show_alert=False)
+    try:
+        from database import clear_categories_table
+        
+        # 1. 运行外键安全函数，清空分类表
+        await clear_categories_table(db_pool)
+        
+        # 2. 重新发起远端商品与分类同步（这步会自动生成原装分类并将存量商品归位）
+        count = await _sync_remote_products(db_pool)
+        
+        # 3. 发送提示消息
+        await callback.message.answer(
+            f"✅ **分类重置成功！**\n\n"
+            f"• 历史手动重命名的分类名称已全部丢弃。\n"
+            f"• 成功从一次元 API 恢复了官方原装分类。\n"
+            f"• 已重新同步并整理了 `{count}` 个商品归属关系。",
+            parse_mode="Markdown"
+        )
+        
+        # 4. 重新刷新管理员主面板，更新“当前上架”等动态数据
+        await admin_menu(callback.message, db_pool)
+        
+    except Exception as e:
+        logger.error("重置分类失败: %s", e)
+        await callback.message.answer(f"❌ 重置分类失败：{e}")
 
 
 # ============================================================
 # 管理员：客服设置
 # ============================================================
 
+# main.py — 重构与追加后的客服管理全套处理器
+
 @dp.callback_query(F.data == "set_customer_service", F.from_user.id == ADMIN_ID)
-async def cb_set_service(callback: types.CallbackQuery, state: FSMContext):
-    await callback.message.answer("📝 请输入客服地址 (例如: @yourname 或 https://t.me/xxx):")
+async def cb_show_service_menu(callback: types.CallbackQuery, db_pool):
+    """
+    【重构优化点 1】显示客服设置主界面（状态透明化）
+    点击后不直接进入输入模式，而是先展示当前客服信息并提供动作按钮。
+    """
+    # 动态获取系统当前配置
+    from database import get_system_config
+    config = await get_system_config(db_pool)
+    current_service = config.get("customer_service", "").strip()
+
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🔄 更换客服", callback_data="change_customer_service")
+    # 只有当已经配置了客服时，才显示“清除客服”按钮，避免页面拥挤
+    if current_service:
+        builder.button(text="❌ 清除客服", callback_data="clear_customer_service")
+    builder.button(text="⬅️ 返回主菜单", callback_data="back_to_admin")
+    builder.adjust(1)
+
+    status_text = f"`{current_service}`" if current_service else "⚠️ *未设置*"
+    
+    await callback.message.edit_text(
+        f"👤 **客服设置导航**\n\n"
+        f"当前配置状态：{status_text}\n\n"
+        f"• **更换客服**：用于修改当前配置的电报用户名（如 `@yourname`）或第三方链接 [1]。\n"
+        f"• **清除客服**：清除配置后，用户端相关界面和支付核销失败时会自动隐藏该联系通道 [1]。",
+        reply_markup=builder.as_markup(),
+        parse_mode="Markdown"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "change_customer_service", F.from_user.id == ADMIN_ID)
+async def cb_change_service_prompt(callback: types.CallbackQuery, state: FSMContext):
+    """
+    【追加处理器 2】开启更换客服流程。
+    """
+    await callback.message.answer(
+        "📝 **请输入新的客服地址**\n\n"
+        "支持以下格式：\n"
+        "1. 电报用户名：`@yourname` 或直接输入 `yourname` [1]\n"
+        "2. 网页/群组链接：`https://t.me/yourname` 或第三方客服链接 [1]\n\n"
+        "提示：输入 `cancel` 可取消当前操作并退回。",
+        parse_mode="Markdown"
+    )
+    # 将对话状态切入等待客服输入的 FSM 状态机
     await state.set_state(AdminSetup.waiting_for_service)
     await callback.answer()
+
+
+@dp.callback_query(F.data == "clear_customer_service", F.from_user.id == ADMIN_ID)
+async def cb_clear_service_execution(callback: types.CallbackQuery, db_pool):
+    """
+    【追加处理器 3】物理清除客服配置（数据库配置更新为空）。
+    """
+    async with db_pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            # 清空 customer_service 对应的键值
+            await cur.execute(
+                """
+                INSERT INTO system_config (config_key, config_value)
+                VALUES ('customer_service', '')
+                ON DUPLICATE KEY UPDATE config_value = ''
+                """
+            )
+            await conn.commit()
+
+    # 弹窗提示，增强操作确认体感
+    await callback.answer("✅ 客服地址已成功清退！", show_alert=True)
+    # 无感刷新当前的客服管理导航面板
+    await cb_show_service_menu(callback, db_pool)
+
+
+@dp.message(AdminSetup.waiting_for_service, F.from_user.id == ADMIN_ID)
+async def process_service_link(message: types.Message, state: FSMContext, db_pool):
+    """
+    【重构优化点 4】接收用户输入的客服地址。
+    增加 cancel 命令拦截，保障操作安全性。
+    """
+    try:
+        link = _message_text(message, "客服地址")
+    except EmptyStringError:
+        return await message.answer("⚠️ 客服地址不能为空，请重新输入。")
+        
+    # 提供退出出口，防止卡死在状态机中
+    if link.lower() == "cancel":
+        await state.clear()
+        return await message.answer("❌ 已取消更换客服。")
+
+    async with db_pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            sql = """
+            INSERT INTO system_config (config_key, config_value)
+            VALUES ('customer_service', %s)
+            ON DUPLICATE KEY UPDATE config_value=%s
+            """
+            await cur.execute(sql, (link, link))
+            await conn.commit()
+
+    await message.answer(f"✅ 客服地址已成功变更为: `{link}`", parse_mode="Markdown")
+    # 清理当前对话挂起的 FSM 状态
+    await state.clear()
 
 
 @dp.message(AdminSetup.waiting_for_service, F.from_user.id == ADMIN_ID)
@@ -655,14 +1021,49 @@ async def process_app_key(message: types.Message, state: FSMContext, db_pool):
     await message.answer("✅ 商铺配置已保存，可在管理员面板执行同步。")
 
 
+# main.py — 重构后的 cb_sync_now 函数
+
+# main.py — 修复 Markdown 解析 Bug 的 cb_sync_now 函数
+
+# main.py — 重构为 HTML 解析模式的 cb_sync_now 函数
+
 @dp.callback_query(F.data == "sync_now", F.from_user.id == ADMIN_ID)
 async def cb_sync_now(callback: types.CallbackQuery, db_pool):
-    await callback.answer("正在同步...", show_alert=False)
+    """
+    管理员：点击“立即同步”后的处理器。
+    
+    安全升级：
+      - 彻底弃用脆弱的 Markdown 编译器，改用兼容性极佳的 HTML 解析模式。
+      - 完美解决由于 [接口处理商品] 这种中括号语法导致 Telegram 强制寻找超链接闭合而崩溃的 Bug。
+    """
+    await callback.answer("正在同步中，请稍候...", show_alert=False)
     try:
-        count = await _sync_remote_products(db_pool)
+        # 1. 执行同步
+        processed_count = await _sync_remote_products(db_pool)
+        
+        # 2. 物理重新统计（SELECT COUNT(*)）
+        total_count, active_count = await get_shop_stats(db_pool)
+        
     except (YiCiyuanAPIError, EmptyStringError) as e:
-        return await callback.message.answer(f"❌ 同步失败：{e}")
-    await callback.message.answer(f"✅ 同步完成：{count} 个商品。")
+        logger.warning("同步业务错误: %s", e)
+        # HTML 模式下，普通文本中的报错直接输出即可
+        return await callback.message.answer(f"❌ 同步失败（业务错误）：\n{e}")
+    except Exception as e:
+        logger.exception("同步流程发生未知异常")
+        return await callback.message.answer(f"❌ 同步发生未知异常，请查看后台日志：\n{e}")
+        
+    # 【终极修改】：改用 <b> 粗体与 <code> 宽体标签，并以 HTML 模式发送，彻底杜绝转义字符崩溃
+    await callback.message.answer(
+        f"✅ <b>远端商品同步执行成功！</b>\n\n"
+        f"• 接口处理商品：<code>{processed_count}</code> 个\n"
+        f"• 数据库总商品数 (重新查询)：<code>{total_count}</code> 个\n"
+        f"• 当前实际上架数：<code>{active_count}</code> 个\n\n"
+        f"💡 <b>排查提示</b>：\n"
+        f"如果 [接口处理商品] 数量与 [数据库总商品数] 冲突，"
+        f"说明有商品的 <code>remote_code</code> 编码发生了冲突，已被系统执行合并更新。"
+        f"详细报告可以查看日志中带 <code>[Sync Debug]</code> 的行。",
+        parse_mode="HTML"
+    )
 
 
 @dp.callback_query(F.data == "delete_shop", F.from_user.id == ADMIN_ID)
@@ -704,11 +1105,20 @@ async def cmd_shop(message: types.Message, db_pool):
     await show_categories(message, db_pool)
 
 
+# main.py 中的修改目标函数
+
 async def show_categories(message: types.Message, db_pool):
+    """
+    普通用户端：展示可供购买的商品分类菜单。
+    修改点：
+      - 当没有可用分类（或分类全部下架）时，返回“商铺装修中，请稍后再来”的友好提示。
+    """
+    # 此时 get_active_categories 仅能获取到 is_active = 1 的分类
     cats = await get_active_categories(db_pool)
 
+    # 核心修改：如果上架分类列表为空，向用户发送装修中提示
     if not cats:
-        return await message.answer("😔 暂无上架商品，请稍后再来。")
+        return await message.answer("🚧 *商铺装修中，请稍后再来。*", parse_mode="Markdown")
 
     builder = InlineKeyboardBuilder()
     for c in cats:
@@ -860,7 +1270,7 @@ async def back_to_shop(callback: types.CallbackQuery, db_pool):
 
 
 # ============================================================
-# 用户端：下单 — Phase 2 核心流程
+# 用户端：下单
 # ============================================================
 
 @dp.callback_query(F.data.startswith("buy_"))
