@@ -1,8 +1,9 @@
 """
-database.py — 完整版，修复所有已知问题
-修复点：
+database.py — 完整版
+已修复：
+  - [重要修改] get_shop_stats：统计在售商品数时关联 categories 表，确保排除已禁用分类下的商品。
   - find_pending_order_by_amount 过滤已过期订单
-  - expire_stale_orders 改用 expires_at 字段（精确到分钟）
+  - expire_stale_orders 改用 expires_at 字段
   - create_order 写入 expires_at
   - DECIMAL(20,6) 统一精度，金额全程字符串传参
   - get_processed_tx_hashes 只加载近 7 天记录，防内存溢出
@@ -118,8 +119,20 @@ async def set_listener_cursor_ms(pool, timestamp_ms: int) -> None:
 # 商品
 # ============================================================
 
+# database.py — 增加高级调试日志的 save_remote_products 函数
+
+# database.py — 优化查重机制与日志日志的 save_remote_products 函数
+
+# database.py — 缩进严格对齐的安全版本
+
 async def save_remote_products(pool, categories: list) -> int:
+    """
+    保存并更新从远端同步过来的商品与分类。
+    """
     count = 0
+    
+    logger.info("🔍 [Sync Debug] 开始执行本地数据保存，传入本地的分类数: %d", len(categories))
+    
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             for cat in categories:
@@ -129,9 +142,10 @@ async def save_remote_products(pool, categories: list) -> int:
                         "category_name",
                     )
                 except EmptyStringError:
-                    logger.warning("跳过空分类: %s", cat)
+                    logger.warning("🔍 [Sync Debug] 跳过空分类: %s", cat)
                     continue
 
+                # 写入或更新分类
                 await cur.execute(
                     """
                     INSERT INTO categories (category_name, is_active)
@@ -141,16 +155,23 @@ async def save_remote_products(pool, categories: list) -> int:
                     (category_name,),
                 )
 
-                for item in cat.get("children", []):
+                children = cat.get("children", [])
+                logger.info("🔍 [Sync Debug] 分类 [%s] 下包含的子商品数量: %d", category_name, len(children))
+
+                for item in children:
                     try:
                         remote_code = require_non_empty_text(item.get("code"), "remote_code")
                         remote_name = require_non_empty_text(
                             item.get("name") or item.get("remote_name"),
                             "remote_name",
                         )
-                    except EmptyStringError:
-                        logger.warning("跳过空商品: category=%s item=%s", category_name, item)
+                    except EmptyStringError as e:
+                        logger.warning(
+                            "🔍 [Sync Debug] 同步跳过(字段空异常): 分类=%s, 商品=%s, 原因=%s", 
+                            category_name, item, e
+                        )
                         continue
+                        
                     raw_price = item.get("price", "0")
                     sync_price = "0" if raw_price is None or str(raw_price).strip() == "" else str(raw_price)
 
@@ -158,31 +179,41 @@ async def save_remote_products(pool, categories: list) -> int:
                     INSERT INTO products (remote_code, remote_name, category_name, last_sync_price, is_active)
                     VALUES (%s, %s, %s, %s, 1)
                     ON DUPLICATE KEY UPDATE
-                        remote_name=%s,
-                        category_name=%s,
-                        last_sync_price=%s
+                        remote_name = VALUES(remote_name),
+                        category_name = VALUES(category_name),
+                        last_sync_price = VALUES(last_sync_price)
                     """
                     await cur.execute(sql, (
                         remote_code,
                         remote_name,
                         category_name,
                         sync_price,
-                        remote_name,
-                        category_name,
-                        sync_price,
                     ))
                     count += 1
-    return count
+                    
+                    logger.debug(
+                        "🔍 [Sync Debug] 成功处理商品: code=%s, name=%s", 
+                        remote_code, remote_name
+                    )
+            
+            # 【重要修改】：将日志和返回语句安全地放在 cursor 块的最底部（缩进12个空格），避免任何缩进混淆
+            logger.info("🔍 [Sync Debug] 商品落库事务处理完毕。本次同步写入的商品总数: %d", count)
+            return count
 
+
+# database.py — 确保分类在普通用户端按 ID 升序固定排列
+
+# database.py — 确保前台排序也固定不变
 
 async def get_active_categories(pool) -> list:
-    """获取全部分类（用于管理员面板和用户菜单）"""
+    """获取处于上架（启用）状态的分类列表（用于普通用户端展示）"""
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(
                 """
                 SELECT id, category_name, is_active 
                 FROM categories 
+                WHERE is_active = 1
                 ORDER BY id ASC
                 """
             )
@@ -217,11 +248,27 @@ async def get_product_by_id(pool, product_id: int) -> dict | None:
 
 
 async def get_shop_stats(pool) -> tuple[int, int]:
+    """
+    【核心修改】获取管理员面板的主菜单数据统计。
+    修改点：
+      - 统计 active 实际上架数时，采用 JOIN 关联 categories，
+        只有商品状态和分类状态同时激活（双重激活，is_active=1）时，才算上架，
+        完美解决因分类下架导致“上架中”商品数量统计不准确的问题。
+    """
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute("SELECT COUNT(*) as total FROM products")
             t = await cur.fetchone()
-            await cur.execute("SELECT COUNT(*) as active FROM products WHERE is_active=1")
+            
+            # 仅统计分类和商品本身均为激活（上架）状态的数量
+            await cur.execute(
+                """
+                SELECT COUNT(*) as active 
+                FROM products p
+                JOIN categories c ON p.category_name = c.category_name
+                WHERE p.is_active = 1 AND c.is_active = 1
+                """
+            )
             a = await cur.fetchone()
             return t["total"], a["active"]
 
@@ -587,3 +634,25 @@ async def save_delivery_record(
                 """,
                 (order_id, product_id, status, content, error_msg),
             )
+
+
+# database.py - 追加以下函数
+
+async def clear_categories_table(pool) -> None:
+    """
+    管理员高级功能：清空全部分类表。
+    安全考虑：
+      - 由于 products 表对 categories 表可能存在外键关联约束，
+        我们在删除前会临时禁用 MySQL 的外键检查，防止因 ON DELETE RESTRICT 导致删除报错。
+    """
+    async with pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            # 1. 临时关闭外键安全检查
+            await cur.execute("SET FOREIGN_KEY_CHECKS = 0")
+            try:
+                # 2. 清空分类表（使用 DELETE 以便在事务连接池中安全工作）
+                await cur.execute("DELETE FROM categories")
+                await conn.commit()
+            finally:
+                # 3. 无论成功或失败，都必须恢复外键安全检查
+                await cur.execute("SET FOREIGN_KEY_CHECKS = 1")
