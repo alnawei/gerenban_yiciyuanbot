@@ -51,8 +51,7 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (tg_id),
-    KEY idx_users_tg_id (tg_id)
+    PRIMARY KEY (tg_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 CREATE TABLE IF NOT EXISTS recharge_orders (
@@ -76,7 +75,7 @@ CREATE TABLE IF NOT EXISTS recharge_orders (
     KEY idx_orders_user_status (user_id, status),
     KEY idx_orders_status_expires (status, expires_at),
     KEY idx_orders_final_amount (final_amount),
-    KEY idx_orders_tx_hash (tx_hash),
+    UNIQUE KEY uk_orders_tx_hash (tx_hash),
     CONSTRAINT chk_orders_tx_hash_nonempty CHECK (
         tx_hash IS NULL OR tx_hash <> ''
     )
@@ -90,7 +89,6 @@ CREATE TABLE IF NOT EXISTS tx_records (
     created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     UNIQUE KEY uk_tx_records_tx_hash (tx_hash),
-    KEY idx_tx_records_tx_hash (tx_hash),
     KEY idx_tx_records_order_id (order_id),
     KEY idx_tx_records_created_at (created_at),
     CONSTRAINT chk_tx_records_tx_hash_nonempty CHECK (tx_hash <> '')
@@ -108,7 +106,6 @@ CREATE TABLE IF NOT EXISTS delivery_records (
         ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     UNIQUE KEY uk_delivery_order (order_id),
-    KEY idx_delivery_order_id (order_id),
     KEY idx_delivery_product_id (product_id),
     KEY idx_delivery_status (status)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
