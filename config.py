@@ -33,6 +33,8 @@ DB_CONFIG = {
     "password": os.getenv("DB_PASSWORD", ""),
     "db": os.getenv("DB_NAME", "tg_bot_db"),
     "charset": "utf8mb4",
+    "use_unicode": True,
+    "init_command": "SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci",
     "minsize": 2,
     "maxsize": 10,
 }

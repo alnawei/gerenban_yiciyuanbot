@@ -4,14 +4,17 @@ Telegram 机器人主入口 — Phase 1 + Phase 2 完整版
 """
 
 import asyncio
+import contextlib
 import logging
 import time
+import uuid
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Awaitable, Callable
 
 import aiomysql
 import redis.asyncio as redis
 from aiogram import BaseMiddleware, Bot, Dispatcher, types, F
+from aiogram.exceptions import TelegramConflictError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -33,11 +36,14 @@ from database import (
     get_system_config,
     update_system_config,
     save_remote_products,
+    get_active_categories,
     get_user_data,
     get_shop_stats,
     get_product_by_id,
     get_order_by_id,
     expire_stale_orders,
+    EmptyStringError,
+    require_non_empty_text,
 )
 from payments import place_payment_order, quantize_base
 from yiciyuan_api import YiCiyuanAPI, YiCiyuanAPIError
@@ -53,6 +59,9 @@ logger = logging.getLogger(__name__)
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+INSTANCE_LOCK_KEY = "telegram_bot:polling_instance"
+INSTANCE_LOCK_TTL = 60
 
 
 class InjectMiddleware(BaseMiddleware):
@@ -83,6 +92,69 @@ class AdminSetup(StatesGroup):
 
 class UserRecharge(StatesGroup):
     waiting_for_amount = State()
+
+
+class InstanceLock:
+    def __init__(self, redis_client, key: str, ttl: int):
+        self.redis = redis_client
+        self.key = key
+        self.ttl = ttl
+        self.token = uuid.uuid4().hex
+        self._renew_task: asyncio.Task | None = None
+
+    async def __aenter__(self):
+        ok = await self.redis.set(self.key, self.token, nx=True, ex=self.ttl)
+        if not ok:
+            raise RuntimeError(
+                "检测到已有机器人实例在运行，请先停止旧进程，避免 TelegramConflictError。"
+            )
+        self._renew_task = asyncio.create_task(self._renew())
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        if self._renew_task:
+            self._renew_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._renew_task
+        await self.redis.eval(
+            """
+            if redis.call('get', KEYS[1]) == ARGV[1] then
+                return redis.call('del', KEYS[1])
+            end
+            return 0
+            """,
+            1,
+            self.key,
+            self.token,
+        )
+
+    async def _renew(self):
+        while True:
+            await asyncio.sleep(max(1, self.ttl // 3))
+            current = await self.redis.get(self.key)
+            if current != self.token:
+                raise RuntimeError("机器人单实例锁已丢失")
+            await self.redis.expire(self.key, self.ttl)
+
+
+def _message_text(message: types.Message, field_name: str) -> str:
+    return require_non_empty_text(message.text, field_name)
+
+
+async def _sync_remote_products(db_pool) -> int:
+    config = await get_system_config(db_pool)
+    shop_url = config.get("shop_url")
+    app_id = config.get("app_id")
+    app_key = config.get("app_key")
+    if not all([shop_url, app_id, app_key]):
+        raise EmptyStringError("商铺 API 配置不完整")
+
+    api = YiCiyuanAPI(shop_url, app_id, app_key, bot=bot)
+    result = await api.get_items()
+    if result.get("code") not in (0, 200, "0", "200"):
+        raise YiCiyuanAPIError("/shared/commodity/items", result.get("msg", "同步失败"))
+    categories = result.get("data", {}).get("list", [])
+    return await save_remote_products(db_pool, categories)
 
 
 def _customer_service_url(customer_service: str) -> str:
@@ -174,7 +246,10 @@ async def start_rename(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(AdminSetup.waiting_for_new_name, F.from_user.id == ADMIN_ID)
 async def process_new_name(message: types.Message, state: FSMContext, db_pool):
-    new_name = message.text.strip()
+    try:
+        new_name = _message_text(message, "商品名称")
+    except EmptyStringError:
+        return await message.answer("⚠️ 商品名称不能为空，请重新输入。")
     if new_name.lower() == "cancel":
         await state.clear()
         return await message.answer("❌ 已取消商品改名。")
@@ -215,7 +290,10 @@ async def start_rename_cat(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(AdminSetup.waiting_for_new_cat_name, F.from_user.id == ADMIN_ID)
 async def process_new_cat_name(message: types.Message, state: FSMContext, db_pool):
-    new_cat_name = message.text.strip()
+    try:
+        new_cat_name = _message_text(message, "分类名称")
+    except EmptyStringError:
+        return await message.answer("⚠️ 分类名称不能为空，请重新输入。")
     if new_cat_name.lower() == "cancel":
         await state.clear()
         return await message.answer("❌ 已取消分类改名。")
@@ -229,6 +307,15 @@ async def process_new_cat_name(message: types.Message, state: FSMContext, db_poo
                 "UPDATE products SET category_name=%s WHERE category_name=%s",
                 (new_cat_name, old_cat_name),
             )
+            await cur.execute(
+                """
+                INSERT INTO categories (category_name, is_active)
+                VALUES (%s, 1)
+                ON DUPLICATE KEY UPDATE category_name=VALUES(category_name)
+                """,
+                (new_cat_name,),
+            )
+            await cur.execute("DELETE FROM categories WHERE category_name=%s", (old_cat_name,))
             await conn.commit()
 
     kb = InlineKeyboardBuilder()
@@ -262,7 +349,10 @@ async def start_set_price(callback: types.CallbackQuery, state: FSMContext, db_p
 
 @dp.message(AdminSetup.waiting_for_price, F.from_user.id == ADMIN_ID)
 async def process_set_price(message: types.Message, state: FSMContext, db_pool):
-    text = message.text.strip()
+    try:
+        text = _message_text(message, "商品价格")
+    except EmptyStringError:
+        return await message.answer("⚠️ 价格不能为空，请输入有效的正数价格。")
     if text.lower() == "cancel":
         await state.clear()
         return await message.answer("❌ 已取消设置价格。")
@@ -315,7 +405,10 @@ async def admin_manage_cats(callback: types.CallbackQuery, db_pool):
 
     builder = InlineKeyboardBuilder()
     for c in cats:
-        cat_name = c["category_name"]
+        try:
+            cat_name = require_non_empty_text(c["category_name"], "category_name")
+        except EmptyStringError:
+            continue
         active = c["active_count"] or 0
         short_cat = (cat_name[:12] + "..") if len(cat_name) > 12 else cat_name
         builder.button(text=f"📂 {short_cat} ({active}/{c['total']})", callback_data=f"ashelf_cat_{cat_name}")
@@ -344,7 +437,13 @@ async def admin_on_shelf(callback: types.CallbackQuery, db_pool):
 
     builder = InlineKeyboardBuilder()
     for p in prods:
-        actual_name = p["display_name"] if p["display_name"] else p["remote_name"]
+        try:
+            actual_name = require_non_empty_text(
+                p["display_name"] if p["display_name"] else p["remote_name"],
+                "product_name",
+            )
+        except EmptyStringError:
+            continue
         short_name = (actual_name[:12] + "..") if len(actual_name) > 12 else actual_name
         status_icon = "✅" if p["is_active"] == 1 else "❌"
         builder.button(text=f"📦 {short_name}", callback_data="none")
@@ -403,7 +502,13 @@ async def toggle_product(callback: types.CallbackQuery, db_pool):
 
     builder = InlineKeyboardBuilder()
     for p in prods:
-        actual_name = p["display_name"] if p["display_name"] else p["remote_name"]
+        try:
+            actual_name = require_non_empty_text(
+                p["display_name"] if p["display_name"] else p["remote_name"],
+                "product_name",
+            )
+        except EmptyStringError:
+            continue
         short_name = (actual_name[:12] + "..") if len(actual_name) > 12 else actual_name
         status_icon = "✅" if p["is_active"] == 1 else "❌"
         builder.button(text=f"📦 {short_name}", callback_data="none")
@@ -438,7 +543,10 @@ async def cb_set_service(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(AdminSetup.waiting_for_service, F.from_user.id == ADMIN_ID)
 async def process_service_link(message: types.Message, state: FSMContext, db_pool):
-    link = message.text
+    try:
+        link = _message_text(message, "客服地址")
+    except EmptyStringError:
+        return await message.answer("⚠️ 客服地址不能为空，请重新输入。")
     async with db_pool.acquire() as conn:
         async with conn.cursor() as cur:
             sql = """
@@ -450,6 +558,72 @@ async def process_service_link(message: types.Message, state: FSMContext, db_poo
 
     await message.answer(f"✅ 客服地址已设置为: {link}")
     await state.clear()
+
+
+@dp.callback_query(F.data == "setup_shop", F.from_user.id == ADMIN_ID)
+async def cb_setup_shop(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.answer("🔗 请输入一次元商铺 API 地址：")
+    await state.set_state(AdminSetup.waiting_for_url)
+    await callback.answer()
+
+
+@dp.message(AdminSetup.waiting_for_url, F.from_user.id == ADMIN_ID)
+async def process_shop_url(message: types.Message, state: FSMContext):
+    try:
+        shop_url = _message_text(message, "商铺地址")
+    except EmptyStringError:
+        return await message.answer("⚠️ 商铺地址不能为空，请重新输入。")
+    await state.update_data(shop_url=shop_url)
+    await message.answer("🆔 请输入 app_id：")
+    await state.set_state(AdminSetup.waiting_for_id)
+
+
+@dp.message(AdminSetup.waiting_for_id, F.from_user.id == ADMIN_ID)
+async def process_app_id(message: types.Message, state: FSMContext):
+    try:
+        app_id = _message_text(message, "app_id")
+    except EmptyStringError:
+        return await message.answer("⚠️ app_id 不能为空，请重新输入。")
+    await state.update_data(app_id=app_id)
+    await message.answer("🔑 请输入 app_key：")
+    await state.set_state(AdminSetup.waiting_for_key)
+
+
+@dp.message(AdminSetup.waiting_for_key, F.from_user.id == ADMIN_ID)
+async def process_app_key(message: types.Message, state: FSMContext, db_pool):
+    try:
+        app_key = _message_text(message, "app_key")
+        data = await state.get_data()
+        await update_system_config(db_pool, data.get("shop_url"), data.get("app_id"), app_key)
+    except EmptyStringError as e:
+        return await message.answer(f"⚠️ 配置不能为空：{e}")
+
+    await state.clear()
+    await message.answer("✅ 商铺配置已保存，可在管理员面板执行同步。")
+
+
+@dp.callback_query(F.data == "sync_now", F.from_user.id == ADMIN_ID)
+async def cb_sync_now(callback: types.CallbackQuery, db_pool):
+    await callback.answer("正在同步...", show_alert=False)
+    try:
+        count = await _sync_remote_products(db_pool)
+    except (YiCiyuanAPIError, EmptyStringError) as e:
+        return await callback.message.answer(f"❌ 同步失败：{e}")
+    await callback.message.answer(f"✅ 同步完成：{count} 个商品。")
+
+
+@dp.callback_query(F.data == "delete_shop", F.from_user.id == ADMIN_ID)
+async def cb_delete_shop(callback: types.CallbackQuery, db_pool):
+    async with db_pool.acquire() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(
+                """
+                DELETE FROM system_config
+                WHERE config_key IN ('shop_url', 'app_id', 'app_key')
+                """
+            )
+    await callback.message.answer("✅ 商铺配置已删除，已同步商品数据不会自动删除。")
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "back_to_admin", F.from_user.id == ADMIN_ID)
@@ -478,19 +652,18 @@ async def cmd_shop(message: types.Message, db_pool):
 
 
 async def show_categories(message: types.Message, db_pool):
-    async with db_pool.acquire() as conn:
-        async with conn.cursor(aiomysql.DictCursor) as cur:
-            await cur.execute(
-                "SELECT DISTINCT category_name FROM products WHERE is_active=1"
-            )
-            cats = await cur.fetchall()
+    cats = await get_active_categories(db_pool)
 
     if not cats:
         return await message.answer("😔 暂无上架商品，请稍后再来。")
 
     builder = InlineKeyboardBuilder()
     for c in cats:
-        builder.button(text=c["category_name"], callback_data=f"cat_{c['category_name']}")
+        try:
+            category_name = require_non_empty_text(c["category_name"], "category_name")
+        except EmptyStringError:
+            continue
+        builder.button(text=category_name, callback_data=f"cat_{category_name}")
     builder.adjust(1)
     await message.answer("请选择商品分类：", reply_markup=builder.as_markup())
 
@@ -531,7 +704,10 @@ async def process_recharge_amount(
     db_pool,
     redis_client,
 ):
-    text = message.text.strip()
+    try:
+        text = _message_text(message, "充值金额")
+    except EmptyStringError:
+        return await message.answer("⚠️ 金额不能为空，请输入有效的正数金额。")
     if text.lower() == "cancel":
         await state.clear()
         return await message.answer("❌ 已取消充值。")
@@ -603,7 +779,13 @@ async def show_products_by_cat(callback: types.CallbackQuery, db_pool):
 
     builder = InlineKeyboardBuilder()
     for p in prods:
-        name = p["display_name"] if p["display_name"] else p["remote_name"]
+        try:
+            name = require_non_empty_text(
+                p["display_name"] if p["display_name"] else p["remote_name"],
+                "product_name",
+            )
+        except EmptyStringError:
+            continue
         price_str = f"{p['price']} USDT" if p.get("price") else "价格面议"
         builder.button(text=f"{name} — {price_str}", callback_data=f"buy_{p['id']}")
 
@@ -661,7 +843,13 @@ async def buy_product(callback: types.CallbackQuery, db_pool, redis_client):
         )
 
     order_id, final_amount = result
-    product_name = product.get("display_name") or product.get("remote_name")
+    try:
+        product_name = require_non_empty_text(
+            product.get("display_name") or product.get("remote_name"),
+            "product_name",
+        )
+    except EmptyStringError:
+        return await callback.answer("❌ 商品名称异常，请联系管理员", show_alert=True)
     config = await get_system_config(db_pool)
     customer_service = config.get("customer_service", "")
 
@@ -716,22 +904,12 @@ async def auto_sync_task(db_pool):
     while True:
         await asyncio.sleep(600)
         try:
-            config = await get_system_config(db_pool)
-            shop_url = config.get("shop_url")
-            app_id = config.get("app_id")
-            app_key = config.get("app_key")
-            if not all([shop_url, app_id, app_key]):
-                continue
-            api = YiCiyuanAPI(shop_url, app_id, app_key, bot=bot)
-            try:
-                result = await api.get_items()
-            except YiCiyuanAPIError as e:
-                logger.error("自动同步 API 失败: %s", e)
-                continue
-            if result.get("code") == 0:
-                categories = result.get("data", {}).get("list", [])
-                count = await save_remote_products(db_pool, categories)
-                logger.info("自动同步完成：%d 个商品", count)
+            count = await _sync_remote_products(db_pool)
+            logger.info("自动同步完成：%d 个商品", count)
+        except EmptyStringError:
+            continue
+        except YiCiyuanAPIError as e:
+            logger.error("自动同步 API 失败: %s", e)
         except Exception as e:
             logger.error("自动同步异常: %s", e)
 
@@ -779,17 +957,21 @@ async def start_bot():
 
     await bot.delete_webhook(drop_pending_updates=True)
 
-    asyncio.create_task(auto_sync_task(db_pool))
-    asyncio.create_task(order_expire_task(db_pool, redis_client))
-    asyncio.create_task(tron_listener_task(db_pool, redis_client))
-
-    logger.info("🚀 Bot 已启动，链上监听已开启")
-
     try:
-        await dp.start_polling(bot)
+        async with InstanceLock(redis_client, INSTANCE_LOCK_KEY, INSTANCE_LOCK_TTL):
+            asyncio.create_task(auto_sync_task(db_pool))
+            asyncio.create_task(order_expire_task(db_pool, redis_client))
+            asyncio.create_task(tron_listener_task(db_pool, redis_client))
+
+            logger.info("🚀 Bot 已启动，链上监听已开启")
+            await dp.start_polling(bot)
+    except TelegramConflictError:
+        logger.error("Telegram polling 冲突：已有实例正在 getUpdates，请停止旧进程后重启。")
+        raise
     finally:
         await redis_client.aclose()
-        await db_pool.close()
+        db_pool.close()
+        await db_pool.wait_closed()
         await bot.session.close()
 
 

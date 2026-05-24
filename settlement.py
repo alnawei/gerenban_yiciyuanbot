@@ -7,7 +7,7 @@ from decimal import Decimal
 
 import aiomysql
 
-from database import normalize_amount
+from database import EmptyStringError, normalize_amount, require_non_empty_text
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +51,7 @@ async def _mark_order_paid_in_tx(cur, order_id: int, tx_hash: str) -> bool:
 async def _record_tx_hash_in_tx(
     cur, tx_hash: str, order_id: int | None, amount: Decimal
 ):
+    tx_hash = require_non_empty_text(tx_hash, "tx_hash")
     await cur.execute(
         """
         INSERT IGNORE INTO tx_records (tx_hash, order_id, amount)
@@ -90,6 +91,9 @@ async def _save_delivery_in_tx(
     content: str,
     error_msg: str,
 ):
+    status = require_non_empty_text(status, "delivery status")
+    content = None if content is None or str(content).strip() == "" else str(content)
+    error_msg = None if error_msg is None or str(error_msg).strip() == "" else str(error_msg)
     await cur.execute(
         """
         INSERT INTO delivery_records
@@ -111,7 +115,9 @@ async def atomic_mark_paid_and_record(
     usdt_amount: Decimal,
 ) -> bool:
     """事务：标记 paid + 写入 tx_records。"""
-    if not tx_hash:
+    try:
+        tx_hash = require_non_empty_text(tx_hash, "tx_hash")
+    except EmptyStringError:
         return False
 
     async with pool.acquire() as conn:
@@ -142,7 +148,9 @@ async def atomic_settle_recharge(
     usdt_amount: Decimal,
 ) -> bool:
     """事务：标记 paid + tx_records + 加余额 + fulfilled（充值全流程）。"""
-    if not tx_hash:
+    try:
+        tx_hash = require_non_empty_text(tx_hash, "tx_hash")
+    except EmptyStringError:
         return False
 
     async with pool.acquire() as conn:
@@ -173,8 +181,8 @@ async def atomic_complete_purchase(
     product_id: int,
     *,
     success: bool,
-    content: str = "",
-    error_msg: str = "",
+    content: str | None = None,
+    error_msg: str | None = None,
 ) -> None:
     """事务：写入 delivery_records + fulfilled（购买 API 成功后调用）。"""
     async with pool.acquire() as conn:

@@ -30,6 +30,7 @@ TRONGRID_API = "https://api.trongrid.io"
 
 FETCH_LIMIT = 200
 MIN_POLL_INTERVAL = 2
+MAX_RETRY_DELAY = 300
 
 
 def sun_to_usdt(sun_value) -> Decimal:
@@ -82,20 +83,29 @@ class TronListener:
             try:
                 await self._poll()
                 self._fail_count = 0
+                await asyncio.sleep(self.poll_interval)
             except aiohttp.ClientResponseError as exc:
-                if exc.status == 429:
-                    wait = min(60, 5 * (2 ** self._fail_count))
-                    logger.warning("TronGrid 限速 429，%ds 后重试", wait)
-                    self._fail_count += 1
-                    await asyncio.sleep(wait)
-                    continue
-                logger.error("HTTP 错误 %d: %s", exc.status, exc, exc_info=True)
-                self._fail_count += 1
+                wait = self._next_retry_delay()
+                logger.warning(
+                    "TronGrid HTTP %d，%ds 后重试: %s",
+                    exc.status,
+                    wait,
+                    exc.message,
+                )
+                await asyncio.sleep(wait)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                wait = self._next_retry_delay()
+                logger.warning("TronGrid 请求异常，%ds 后重试: %s", wait, exc)
+                await asyncio.sleep(wait)
             except Exception as exc:
-                logger.error("TronListener 轮询异常: %s", exc, exc_info=True)
-                self._fail_count += 1
+                wait = self._next_retry_delay()
+                logger.error("TronListener 轮询异常，%ds 后重试: %s", wait, exc, exc_info=True)
+                await asyncio.sleep(wait)
 
-            await asyncio.sleep(self.poll_interval)
+    def _next_retry_delay(self) -> int:
+        wait = min(MAX_RETRY_DELAY, self.poll_interval * (2 ** self._fail_count))
+        self._fail_count += 1
+        return max(MIN_POLL_INTERVAL, wait)
 
     async def _load_seen_tx(self):
         hashes = await get_processed_tx_hashes(self.db_pool)
@@ -197,13 +207,15 @@ class TronListener:
                     params["fingerprint"] = fingerprint
 
                 async with session.get(url, params=params, timeout=timeout) as resp:
-                    if resp.status == 429:
-                        raise aiohttp.ClientResponseError(
-                            resp.request_info, resp.history, status=429
-                        )
                     if resp.status != 200:
-                        logger.warning("TronGrid 非 200: %d", resp.status)
-                        break
+                        body = await resp.text()
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info,
+                            resp.history,
+                            status=resp.status,
+                            message=body[:300],
+                            headers=resp.headers,
+                        )
                     data = await resp.json(content_type=None)
 
                 batch = data.get("data", [])

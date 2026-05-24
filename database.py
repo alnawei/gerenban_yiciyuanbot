@@ -24,12 +24,34 @@ def normalize_amount(amount: Decimal) -> Decimal:
     """与 migrate_phase2 DECIMAL(20,6) 对齐。"""
     return Decimal(str(amount)).quantize(AMOUNT_QUANT, rounding=ROUND_DOWN)
 
+
+class EmptyStringError(ValueError):
+    """业务字段不允许写入空字符串。"""
+
+
+def require_non_empty_text(value, field_name: str) -> str:
+    """
+    统一拦截空字符串，避免 DB 内出现会破坏 Telegram 按钮渲染的数据。
+    """
+    if value is None:
+        raise EmptyStringError(f"{field_name} 不能为空")
+    text = str(value).strip()
+    if not text:
+        raise EmptyStringError(f"{field_name} 不能为空")
+    return text
+
 # ============================================================
 # 连接池（只在 main.py 启动时调用一次）
 # ============================================================
 
 async def get_db_pool():
-    return await aiomysql.create_pool(**DB_CONFIG, autocommit=True)
+    config = dict(DB_CONFIG)
+    config["charset"] = "utf8mb4"
+    config["use_unicode"] = True
+    return await aiomysql.create_pool(
+        **config,
+        autocommit=True,
+    )
 
 
 # ============================================================
@@ -45,12 +67,19 @@ async def get_system_config(pool) -> dict:
 
 
 async def update_system_config(pool, url: str, app_id: str, app_key: str):
+    url = require_non_empty_text(url, "shop_url")
+    app_id = require_non_empty_text(app_id, "app_id")
+    app_key = require_non_empty_text(app_key, "app_key")
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
-            sql = "UPDATE system_config SET config_value = %s WHERE config_key = %s"
-            await cur.execute(sql, (url, "shop_url"))
-            await cur.execute(sql, (app_id, "app_id"))
-            await cur.execute(sql, (app_key, "app_key"))
+            sql = """
+            INSERT INTO system_config (config_key, config_value)
+            VALUES (%s, %s)
+            ON DUPLICATE KEY UPDATE config_value=VALUES(config_value)
+            """
+            await cur.execute(sql, ("shop_url", url))
+            await cur.execute(sql, ("app_id", app_id))
+            await cur.execute(sql, ("app_key", app_key))
 
 
 LISTENER_CURSOR_KEY = "tron_listener_min_ts"
@@ -94,16 +123,53 @@ async def save_remote_products(pool, categories: list) -> int:
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             for cat in categories:
-                cat_name = cat.get("name")
+                try:
+                    category_name = require_non_empty_text(
+                        cat.get("category_name") or cat.get("name"),
+                        "category_name",
+                    )
+                except EmptyStringError:
+                    logger.warning("跳过空分类: %s", cat)
+                    continue
+
+                await cur.execute(
+                    """
+                    INSERT INTO categories (category_name, is_active)
+                    VALUES (%s, 1)
+                    ON DUPLICATE KEY UPDATE category_name=VALUES(category_name)
+                    """,
+                    (category_name,),
+                )
+
                 for item in cat.get("children", []):
+                    try:
+                        remote_code = require_non_empty_text(item.get("code"), "remote_code")
+                        remote_name = require_non_empty_text(
+                            item.get("name") or item.get("remote_name"),
+                            "remote_name",
+                        )
+                    except EmptyStringError:
+                        logger.warning("跳过空商品: category=%s item=%s", category_name, item)
+                        continue
+                    raw_price = item.get("price", "0")
+                    sync_price = "0" if raw_price is None or str(raw_price).strip() == "" else str(raw_price)
+
                     sql = """
                     INSERT INTO products (remote_code, remote_name, category_name, last_sync_price, is_active)
                     VALUES (%s, %s, %s, %s, 1)
-                    ON DUPLICATE KEY UPDATE remote_name=%s, last_sync_price=%s
+                    ON DUPLICATE KEY UPDATE
+                        remote_name=%s,
+                        category_name=%s,
+                        last_sync_price=%s
                     """
                     await cur.execute(sql, (
-                        item["code"], item["name"], cat_name, str(item["price"]),
-                        item["name"], str(item["price"]),
+                        remote_code,
+                        remote_name,
+                        category_name,
+                        sync_price,
+                        remote_name,
+                        category_name,
+                        sync_price,
                     ))
                     count += 1
     return count
@@ -113,7 +179,14 @@ async def get_active_categories(pool) -> list:
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(
-                "SELECT category_name FROM products WHERE is_active=1 GROUP BY category_name"
+                """
+                SELECT c.category_name
+                FROM categories c
+                JOIN products p ON p.category_name = c.category_name
+                WHERE c.is_active=1 AND p.is_active=1
+                GROUP BY c.category_name
+                ORDER BY c.category_name ASC
+                """
             )
             return await cur.fetchall()
 
@@ -227,6 +300,7 @@ async def create_order(
     """
     base_str = str(normalize_amount(base_amount))
     final_str = str(normalize_amount(final_amount))
+    order_type = require_non_empty_text(order_type, "order_type")
 
     if await pending_amount_exists(pool, final_amount):
         return None
@@ -354,7 +428,11 @@ async def mark_order_paid(pool, order_id: int, tx_hash: str) -> bool:
     乐观锁核销：仅 pending + 未过期 + 尚未绑定 tx_hash 的订单可更新。
     同时将链上哈希写入 recharge_orders.tx_hash。
     """
-    if not tx_hash or await tx_hash_already_used(pool, tx_hash):
+    try:
+        tx_hash = require_non_empty_text(tx_hash, "tx_hash")
+    except EmptyStringError:
+        return False
+    if await tx_hash_already_used(pool, tx_hash):
         return False
 
     async with pool.acquire() as conn:
@@ -447,6 +525,11 @@ async def record_tx_hash(
     amount: Decimal,
 ):
     """记录链上交易，无论是否匹配订单，INSERT IGNORE 保证幂等。"""
+    try:
+        tx_hash = require_non_empty_text(tx_hash, "tx_hash")
+    except EmptyStringError:
+        logger.warning("跳过空 tx_hash 记录")
+        return
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             try:
@@ -473,6 +556,9 @@ async def save_delivery_record(
     content: str,
     error_msg: str,
 ):
+    status = require_non_empty_text(status, "delivery status")
+    content = None if content is None or str(content).strip() == "" else str(content)
+    error_msg = None if error_msg is None or str(error_msg).strip() == "" else str(error_msg)
     async with pool.acquire() as conn:
         async with conn.cursor() as cur:
             await cur.execute(
