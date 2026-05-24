@@ -176,17 +176,31 @@ async def save_remote_products(pool, categories: list) -> int:
 
 
 async def get_active_categories(pool) -> list:
+    """获取全部分类（用于管理员面板和用户菜单）"""
     async with pool.acquire() as conn:
         async with conn.cursor(aiomysql.DictCursor) as cur:
             await cur.execute(
                 """
-                SELECT c.category_name
-                FROM categories c
-                JOIN products p ON p.category_name = c.category_name
-                WHERE c.is_active=1 AND p.is_active=1
-                GROUP BY c.category_name
-                ORDER BY c.category_name ASC
+                SELECT id, category_name, is_active 
+                FROM categories 
+                ORDER BY id ASC
                 """
+            )
+            return await cur.fetchall()
+
+async def get_products_by_category(pool, category_name: str) -> list:
+    async with pool.acquire() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
+            await cur.execute(
+                """
+                SELECT p.* FROM products p
+                JOIN categories c ON p.category_name = c.category_name
+                WHERE p.category_name = %s 
+                  AND p.is_active = 1 
+                  AND c.is_active = 1
+                ORDER BY p.id ASC
+                """,
+                (category_name,)
             )
             return await cur.fetchall()
 
