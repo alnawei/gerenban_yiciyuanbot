@@ -814,42 +814,6 @@ async def toggle_product(callback: types.CallbackQuery, db_pool):
 
 # main.py - 追加以下 Callback 处理器
 
-@dp.callback_query(F.data == "reset_all_categories", F.from_user.id == ADMIN_ID)
-async def cb_reset_all_categories(callback: types.CallbackQuery, db_pool):
-    """
-    管理员：点击“重置所有分类”后的逻辑处理。
-    实现原理：
-      - 调用安全函数清空本地 categories 数据；
-      - 重新运行 API 同步流程，系统会依据 remote_code 更新现有产品的 category_name 指向，
-        自动将其改回一次元官方最原始的分类名称，同时清除后台冗余的重命名记录。
-    """
-    await callback.answer("正在重置分类并拉取 API 重新同步，请稍候...", show_alert=False)
-    try:
-        from database import clear_categories_table
-        
-        # 1. 运行外键安全函数，清空分类表
-        await clear_categories_table(db_pool)
-        
-        # 2. 重新发起远端商品与分类同步（这步会自动生成原装分类并将存量商品归位）
-        count = await _sync_remote_products(db_pool)
-        
-        # 3. 发送提示消息
-        await callback.message.answer(
-            f"✅ **分类重置成功！**\n\n"
-            f"• 历史手动重命名的分类名称已全部丢弃。\n"
-            f"• 成功从一次元 API 恢复了官方原装分类。\n"
-            f"• 已重新同步并整理了 `{count}` 个商品归属关系。",
-            parse_mode="Markdown"
-        )
-        
-        # 4. 重新刷新管理员主面板，更新“当前上架”等动态数据
-        await admin_menu(callback.message, db_pool)
-        
-    except Exception as e:
-        logger.error("重置分类失败: %s", e)
-        await callback.message.answer(f"❌ 重置分类失败：{e}")
-
-
 # ============================================================
 # 管理员：客服设置
 # ============================================================
@@ -958,26 +922,6 @@ async def process_service_link(message: types.Message, state: FSMContext, db_poo
     await message.answer(f"✅ 客服地址已成功变更为: `{link}`", parse_mode="Markdown")
     # 清理当前对话挂起的 FSM 状态
     await state.clear()
-
-
-@dp.message(AdminSetup.waiting_for_service, F.from_user.id == ADMIN_ID)
-async def process_service_link(message: types.Message, state: FSMContext, db_pool):
-    try:
-        link = _message_text(message, "客服地址")
-    except EmptyStringError:
-        return await message.answer("⚠️ 客服地址不能为空，请重新输入。")
-    async with db_pool.acquire() as conn:
-        async with conn.cursor() as cur:
-            sql = """
-            INSERT INTO system_config (config_key, config_value)
-            VALUES ('customer_service', %s)
-            ON DUPLICATE KEY UPDATE config_value=%s
-            """
-            await cur.execute(sql, (link, link))
-
-    await message.answer(f"✅ 客服地址已设置为: {link}")
-    await state.clear()
-
 
 @dp.callback_query(F.data == "setup_shop", F.from_user.id == ADMIN_ID)
 async def cb_setup_shop(callback: types.CallbackQuery, state: FSMContext):
