@@ -1,164 +1,128 @@
-# Telegram 一次元零售机器人
+# TeleRetail — 一次元 Telegram 智能发卡零售系统
 
-这是一个基于 aiogram 的 Telegram 零售机器人，用一次元共享 API 同步商品与自动发货，用 TRON / TronGrid 监听 TRC20 USDT 转账并自动核销订单。
+TeleRetail 是一款专为数字商品发卡与余额充值设计的高性能 Telegram 机器人系统。系统底层通过接入**一次元商铺共享 API** 自动同步商品，并基于波场（TRON）链上轮询与 **TronGrid** 数据服务监听 TRC-20 USDT 的到账情况，实现了高并发场景下的“自动改价防碰撞、转账自动确认、秒级提卡”全流程闭环。
 
-## 核心架构流程
+---
 
-### 模块职责
+## 🛠 系统核心特性
 
-- `main.py`：Telegram Bot 入口，注册用户端与管理员端 handler，启动后台任务，维护单实例运行锁。
-- `database.py`：MySQL 异步数据访问层，负责连接池、商品同步、订单、用户余额、交易哈希去重和监听游标。
-- `payments.py`：创建付款订单，使用 Redis 预锁随机尾数金额，避免多个待支付订单金额相同。
-- `tron_listener.py`：轮询 TronGrid TRC20 入账记录，按精确 `final_amount` 匹配待支付订单，失败时指数退避重试。
-- `settlement.py`：订单核销事务，保证标记支付、记录 tx_hash、充值入账或发货记录写入的原子性。
-- `fulfillment.py`：付款成功后的用户通知与一次元 API 提货。
-- `yiciyuan_api.py`：一次元共享 API 签名、请求、商品拉取和下单封装。
-- `amount_lock.py`：Redis 金额坑位锁，锁 TTL 与订单过期时间一致。
-- `notifications.py`：管理员告警通知。
+### 1. 独创的分布式阶梯式防碰撞金额算法
+* **高并发 $O(1)$ 锁预检**：下单时系统动态生成微小偏移金额（支持最高 3 位小数精度，完美解决 binary 浮点数漂移）。
+* **先抢锁，后查库**：优化了原先的检查机制，系统优先通过 Redis SETNX 分布式锁对金额进行原子抢占，锁定成功后才向 MySQL 发起 `pending` 状态确认，使高并发下的数据库压力从 $O(N)$ 降到 $O(1)$。
+* **锁自动释放**：当订单被取消、超时过期（默认 30 分钟）或核销完成时，金额锁自动回收。
 
-### 业务流程
+### 2. 0 秒热加载与无感知切换
+* **配置数据库级持久化**：TRC-20 收款地址、TronGrid API Key 及客服地址优先从 `system_config` 数据库表热读取，并以降级适配 `.env`。
+* **平滑变更**：管理员在后台管理面板修改收款地址或 TronGrid Key 后，链上监听器会即刻加载新配置进行轮询，**无需重启守护进程**。
 
-1. 管理员通过 `/admin` 配置一次元商铺地址、`app_id`、`app_key`。
-2. 管理员点击“立即同步”，或后台定时任务每 10 分钟同步一次远端商品。
-3. 远端分类写入 `categories.category_name`，商品写入 `products.category_name`，字段统一使用 `category_name`。
-4. 用户通过 `/shop` 浏览上架分类和商品。
-5. 用户下单或充值时，系统基于基础金额生成带 6 位小数随机尾数的 `final_amount`。
-6. `payments.py` 先用 Redis 锁住金额，再写入 `recharge_orders`，订单状态为 `pending`。
-7. `tron_listener.py` 轮询 TronGrid，发现转入 `USDT_WALLET` 的 TRC20 USDT 后，按 `final_amount` 精确匹配未过期订单。
-8. `settlement.py` 使用事务写入 `tx_hash` 并变更订单状态，充值订单同时增加用户余额，购买订单随后调用一次元 API 发货。
-9. 已处理或未匹配的链上交易写入 `tx_records`，防止重启后重复核销。
+### 3. 极高韧性的链上监听器 (TronListener)
+* **防断网挂死设计**：初始化方法（恢复历史去重 Hash 缓存和读取游标）集成于容错轮询循环内部。若由于网络波动或数据库重启导致启动失败，监听器将自动执行**指数退避重试**，防止因单个后台协程静默死亡导致漏单。
+* **复用 HTTP 连接池**：基于 `aiohttp.ClientSession` 持久化生命周期，避免频繁的高并发 TCP 握手开销。
+* **重启不漏单**：持久化毫秒级时间戳游标（Cursor），重启时自动安全向前覆盖重叠窗口（默认 5 分钟），物理阻断漏网之鱼。
 
-## 环境变量配置
+### 4. 极致的前后端安全与排版优化
+* **无颤抖更新**：后台分类管理通过按键布局增量修改（`use_reply_markup_only`），切换状态及删除数据时界面文字不颤抖不闪烁。
+* **物理隔离菜单**：系统通过自定义 Reply 底部键盘对管理员与普通用户进行常驻菜单物理分流。
+* **实体防护（防接口崩溃）**：前台渲染、充值失败通知、管理员中控台一律弃用易碎的 Markdown 解析，全面升级为 `HTML` 模式加 `html.escape` 转义，彻底防御商品名中的下划线 `_`、星号 `*` 等带来的 Telegram 接口解析报错。
+* **严格多表事务**：后台分类管理等涉及多表更新的操作（`products` 与 `categories` 关联重命名、级联删除等）已全面补充 `START TRANSACTION` 控制，严防部分 SQL 独立 autocommit 造成的一致性漏洞。
 
-创建 `.env`：
+---
 
-```env
-BOT_TOKEN=123456:telegram_bot_token
-ADMIN_ID=123456789
+## 📡 核心业务架构流
 
+```text
+ ユーザー (User) ───[ 1. 请求购买/充值 ]───► 机器人 (main.py)
+                                               │ (2. 抢占 Redis 偏移金额锁)
+                                               ▼
+  链上核销 (settlement) ◄───[ 5. 按精确金额匹配 ]─ 监听器 (tron_listener.py)
+   (MySQL START TRANSACTION)                    ▲ (轮询 TRON TRC-20 记录)
+         │                                      │
+         ├─► [Recharge 充值]: 加用户余额          │
+         │                                   USDT (TRC20)
+         └─► [Purchase 购买]: YiCiyuan API 发卡 ───► 用户提货/卡密入库
+
+
+
+📦 项目依赖与技术栈
+开发语言：Python 3.10+
+异步框架：aiogram 3.x (基于最新 Telegram Bot API 架构)
+数据库：MySQL 5.7+ / MariaDB 10.6+
+内存缓存：Redis 6.0+ (提供多层并发金额锁与 Polling 独占锁)
+API 与 SDK：aiohttp 3.9+, aiomysql 0.2+, redis 5.0+
+
+
+⚙️ 环境变量配置 (.env)
+项目目录下需创建并配置 .env 文件（请勿将真实私钥和配置提交至代码库）：
+code
+Env
+# ── Telegram 机器人配置 ──────────────────────────────────────────
+BOT_TOKEN=123456:your_telegram_bot_token
+ADMIN_ID=987654321
+
+# ── 数据库连接（MySQL/MariaDB） ──────────────────────────────────
 DB_HOST=127.0.0.1
 DB_PORT=3306
 DB_USER=tg_bot_db
-DB_PASSWORD=replace_with_strong_password
+DB_PASSWORD=your_mysql_secure_password
 DB_NAME=tg_bot_db
 
+# ── 缓存连接 (Redis) ─────────────────────────────────────────────
 REDIS_URL=redis://127.0.0.1:6379/0
 
-USDT_WALLET=Txxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# ── 支付与链上监听配置 ──────────────────────────────────────────
+# USDT_WALLET 为系统起步默认监听地址，管理员可在后台面板无缝更改
+USDT_WALLET=TXyourtronwalletaddresshereXXXXXX
 TRONGRID_API_KEY=your_trongrid_api_key
 TRON_POLL_INTERVAL=15
 ORDER_EXPIRE_MINUTES=30
 
+# ── 预留业务配置 ─────────────────────────────────────────────────
 DEFAULT_MARKUP_PERCENT=0.2
-```
+🗄 数据库结构设计 (Schema)
+通过配置好 MySQL 后，执行 migrate_phase2.sql 进行建表和初始化。核心数据库包含 7 个功能表：
+system_config：系统级键值对参数，包含远程商铺 API、链上扫描游标等。
+categories：商品分类表（含激活状态，与普通端显示直接联动）。
+products：同步商品表，外键关联 categories.category_name，具有级联约束。
+users：本地用户资产余额。
+recharge_orders：待付与已支付订单详情（主流程实体）。
+tx_records：去重用的链上已处理交易哈希历史。
+delivery_records：提卡卡密及异常日志。
+🚀 部署指南 (Production Deployment)
+为了保证机器人的稳定性，推荐在独立的不具特权系统用户环境下，使用 Supervisor 守护进程进行托管。
+第一步：创建独立系统运行账户
+code
+Bash
+sudo useradd -r -m -d /opt/tgretail tgretail
+sudo mkdir -p /opt/tgretail
+sudo chown -R tgretail:tgretail /opt/tgretail
+第二步：拉取源码与构建虚拟环境
+code
+Bash
+# 切换至低权限用户
+sudo -u tgretail -i
 
-变量说明：
+# 克隆代码
+git clone https://github.com/your-repo/yiiiiciyuan.git /opt/tgretail/app
+cd /opt/tgretail/app
 
-- `BOT_TOKEN`：Telegram BotFather 生成的机器人 token，生产环境必须配置。
-- `ADMIN_ID`：管理员 Telegram 数字 ID。所有管理 handler 都使用该 ID 过滤。
-- `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME`：MySQL 连接配置。连接层强制使用 `utf8mb4`。
-- `REDIS_URL`：Redis 地址，用于金额锁和机器人单实例锁。
-- `USDT_WALLET`：TRON 收款地址，必须是以 `T` 开头的 TRC20 地址。
-- `TRONGRID_API_KEY`：TronGrid API Key，建议生产环境配置，降低限速概率。
-- `TRON_POLL_INTERVAL`：链上轮询间隔，最小会被限制为 2 秒。
-- `ORDER_EXPIRE_MINUTES`：订单有效期，同时也是 Redis 金额锁 TTL。
-- `DEFAULT_MARKUP_PERCENT`：预留业务配置，当前主流程未强依赖。
-
-## 初始化 SQL
-
-完整脚本在 `migrate_phase2.sql`。新库初始化：
-
-```bash
-mysql -u root -p -e "CREATE DATABASE tg_bot_db CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
-mysql -u root -p tg_bot_db < migrate_phase2.sql
-```
-
-核心建表约束：
-
-```sql
-SET NAMES utf8mb4 COLLATE utf8mb4_unicode_ci;
-
-CREATE TABLE IF NOT EXISTS categories (
-    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    category_name VARCHAR(191) NOT NULL,
-    is_active TINYINT(1) NOT NULL DEFAULT 1,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (id),
-    UNIQUE KEY uk_categories_category_name (category_name)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
-CREATE TABLE IF NOT EXISTS products (
-    id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-    remote_code VARCHAR(191) NOT NULL,
-    remote_name VARCHAR(255) NOT NULL,
-    display_name VARCHAR(255) NULL,
-    category_name VARCHAR(191) NOT NULL,
-    last_sync_price DECIMAL(20,6) NOT NULL DEFAULT 0.000000,
-    price DECIMAL(20,2) NULL,
-    is_active TINYINT(1) NOT NULL DEFAULT 1,
-    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (id),
-    UNIQUE KEY uk_products_remote_code (remote_code),
-    KEY idx_products_category_active (category_name, is_active),
-    CONSTRAINT fk_products_category_name
-        FOREIGN KEY (category_name) REFERENCES categories (category_name)
-        ON UPDATE CASCADE ON DELETE RESTRICT,
-    CONSTRAINT chk_products_remote_code_nonempty CHECK (remote_code <> ''),
-    CONSTRAINT chk_products_remote_name_nonempty CHECK (remote_name <> ''),
-    CONSTRAINT chk_products_category_name_nonempty CHECK (category_name <> ''),
-    CONSTRAINT chk_products_display_name_nonempty CHECK (
-        display_name IS NULL OR display_name <> ''
-    )
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-```
-
-运行旧库迁移前建议先备份：
-
-```bash
-mysqldump -u root -p tg_bot_db > tg_bot_db_backup.sql
-mysql -u root -p tg_bot_db < migrate_phase2.sql
-```
-
-## 本地运行
-
-```bash
+# 初始化 Python 虚拟环境与安装依赖
 python3 -m venv .venv
 source .venv/bin/activate
+pip install --upgrade pip
 pip install -r requirements.txt
-python main.py
-```
 
-启动时会执行生产配置自检。若 `BOT_TOKEN`、`ADMIN_ID`、`DB_PASSWORD` 或 `USDT_WALLET` 仍为空或占位符，程序会拒绝启动。
-
-## Supervisor 部署
-
-建议使用独立系统用户运行：
-
-```bash
-sudo useradd -r -m -d /opt/yiiiiciyuan yiiiiciyuan
-sudo mkdir -p /opt/yiiiiciyuan
-sudo chown -R yiiiiciyuan:yiiiiciyuan /opt/yiiiiciyuan
-```
-
-部署代码并安装依赖：
-
-```bash
-sudo -u yiiiiciyuan git clone https://github.com/alnawei/yiiiiciyuan.git /opt/yiiiiciyuan/app
-cd /opt/yiiiiciyuan/app
-sudo -u yiiiiciyuan python3 -m venv .venv
-sudo -u yiiiiciyuan .venv/bin/pip install -r requirements.txt
-sudo -u yiiiiciyuan cp .env.example .env
-```
-
-编辑 `/opt/yiiiiciyuan/app/.env` 后，创建 Supervisor 配置 `/etc/supervisor/conf.d/yiiiiciyuan.conf`：
-
-```ini
-[program:yiiiiciyuan]
-directory=/opt/yiiiiciyuan/app
-command=/opt/yiiiiciyuan/app/.venv/bin/python /opt/yiiiiciyuan/app/main.py
-user=yiiiiciyuan
+# 准备环境变量
+cp .env.example .env
+nano .env # 按照上文配置说明填写
+exit
+第三步：配置 Supervisor 进程管理
+创建配置文件 /etc/supervisor/conf.d/tgretail.conf：
+code
+Ini
+[program:tgretail]
+directory=/opt/tgretail/app
+command=/opt/tgretail/app/.venv/bin/python /opt/tgretail/app/main.py
+user=tgretail
 autostart=true
 autorestart=true
 startsecs=10
@@ -166,35 +130,29 @@ stopwaitsecs=30
 killasgroup=true
 stopsignal=TERM
 environment=PYTHONUNBUFFERED="1"
-stdout_logfile=/var/log/yiiiiciyuan.out.log
-stderr_logfile=/var/log/yiiiiciyuan.err.log
-stdout_logfile_maxbytes=50MB
-stderr_logfile_maxbytes=50MB
+stdout_logfile=/var/log/tgretail.out.log
+stderr_logfile=/var/log/tgretail.err.log
+stdout_logfile_maxbytes=20MB
+stderr_logfile_maxbytes=20MB
 stdout_logfile_backups=5
 stderr_logfile_backups=5
-```
-
-加载并启动：
-
-```bash
+第四步：启动机器人守护
+code
+Bash
 sudo supervisorctl reread
 sudo supervisorctl update
-sudo supervisorctl start yiiiiciyuan
-sudo supervisorctl status yiiiiciyuan
-```
-
-常用运维命令：
-
-```bash
-sudo supervisorctl restart yiiiiciyuan
-sudo supervisorctl tail -f yiiiiciyuan stdout
-sudo supervisorctl tail -f yiiiiciyuan stderr
-```
-
-## 稳定性与安全要点
-
-- 单实例锁：`main.py` 会在 Redis 中创建 `telegram_bot:polling_instance`，防止两个 polling 实例同时运行导致 `TelegramConflictError`。
-- 链上重试：TronGrid 超时、网络异常、4xx、5xx 都会指数退避重试，最长等待 300 秒。
-- 字符集：MySQL 连接和建表都固定为 `utf8mb4`，支持 Telegram 昵称、商品名和 emoji。
-- 空字符串防御：数据库写入入口会拒绝关键业务字段为空，避免空按钮文本导致 Telegram inline keyboard 渲染失败。
-- 权限校验：所有管理员配置、同步、重命名、上下架、定价 handler 均带 `F.from_user.id == ADMIN_ID` 过滤。
+sudo supervisorctl start tgretail
+sudo supervisorctl status tgretail
+🛠 日常运维与监控
+查看实时机器人控制台输出
+code
+Bash
+sudo supervisorctl tail -f tgretail stdout
+查看链上交易或发卡异常输出
+code
+Bash
+sudo supervisorctl tail -f tgretail stderr
+重启机器人（热重载系统配置无需重启，仅代码变更才需要）
+code
+Bash
+sudo supervisorctl restart tgretail
