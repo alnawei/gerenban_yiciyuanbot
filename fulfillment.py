@@ -1,8 +1,9 @@
 """
-fulfillment.py — 核销后的用户通知与购买提货（DB 事务在 settlement.py）
+fulfillment.py — 优化重构版（全面采用 HTML 解析模式，杜绝特殊符号解析崩溃）
 """
 
 import logging
+import html
 from decimal import Decimal
 
 from aiogram import Bot
@@ -22,14 +23,15 @@ async def notify_payment_received(
     tx_hash: str,
 ):
     try:
+        # 转为 HTML 格式
         await bot.send_message(
             user_tg_id,
-            f"✅ *收款已确认！*\n\n"
-            f"📋 订单号：`#{order_id}`\n"
-            f"💰 金额：`{usdt_amount} USDT`\n"
-            f"🔗 Tx：`{tx_hash}`\n\n"
+            f"✅ <b>收款已确认！</b>\n\n"
+            f"📋 订单号：<code>#{order_id}</code>\n"
+            f"💰 金额：<code>{usdt_amount} USDT</code>\n"
+            f"🔗 Tx：<code>{html.escape(tx_hash)}</code>\n\n"
             f"⏳ 正在为您发货，请稍候...",
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
     except Exception as e:
         logger.error("发送收款确认失败 [user %d]: %s", user_tg_id, e)
@@ -62,13 +64,13 @@ async def notify_recharge_completed(
     try:
         await bot.send_message(
             user_tg_id,
-            f"🎉 *充值成功！*\n\n"
-            f"📋 订单号：`#{order_id}`\n"
-            f"💰 到账：`{base_amount} USDT`\n"
-            f"💳 当前余额：`{new_balance:.6f} USDT`\n\n"
+            f"🎉 <b>充值成功！</b>\n\n"
+            f"📋 订单号：<code>#{order_id}</code>\n"
+            f"💰 到账：<code>{base_amount} USDT</code>\n"
+            f"💳 当前余额：<code>{new_balance:.2f} USDT</code>\n\n"
             f"可使用 /shop 购买商品。",
             reply_markup=builder.as_markup() if customer_service else None,
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
     except Exception as e:
         logger.error("推送充值成功消息失败 [user %d]: %s", user_tg_id, e)
@@ -85,7 +87,6 @@ async def fulfill_purchase_after_paid(
     final_amount: Decimal | None = None,
     redis_client=None,
 ):
-    """购买订单：一次元 API 提货 + 事务写入发货记录（支付已在 settlement 完成）。"""
     from database import get_product_by_id, get_system_config
     from yiciyuan_api import YiCiyuanAPI, YiCiyuanAPIError
 
@@ -117,7 +118,7 @@ async def fulfill_purchase_after_paid(
         return
 
     remote_code = product.get("remote_code")
-    product_name = product.get("display_name") or product.get("remote_name")
+    product_name = product.get("display_name") or product.get("remote_name") or "未知商品"
 
     config = await get_system_config(db_pool)
     shop_url = config.get("shop_url")
@@ -229,17 +230,18 @@ async def fulfill_purchase_after_paid(
         )
 
     try:
+        # 使用 HTML 实体发送，对 product_name 进行了 HTML 转义
         await bot.send_message(
             user_tg_id,
-            f"🎉 *发货成功！*\n\n"
-            f"📦 商品：{product_name}\n"
-            f"📋 订单号：`#{order_id}`\n\n"
+            f"🎉 <b>发货成功！</b>\n\n"
+            f"📦 商品：{html.escape(product_name)}\n"
+            f"📋 订单号：<code>#{order_id}</code>\n\n"
             f"━━━━━━━━━━━━━━\n"
             f"{delivery_text}\n"
             f"━━━━━━━━━━━━━━\n\n"
             f"感谢您的购买！",
             reply_markup=builder.as_markup() if customer_service else None,
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
     except Exception as e:
         logger.error("推送发货消息失败: %s", e)
@@ -258,7 +260,6 @@ async def fulfill_purchase_after_paid(
     logger.info("✅ 购买订单 #%d 完成", order_id)
 
 
-# 兼容旧调用（若仍有引用）
 async def fulfill_order(
     db_pool,
     bot: Bot,
@@ -309,17 +310,17 @@ async def _handle_failure(
         )
         builder.button(text="💬 联系客服处理", url=cs_url)
 
-    product_line = f"📦 商品：{product_name}\n" if product_name else ""
+    product_line = f"📦 商品：{html.escape(product_name)}\n" if product_name else ""
     try:
         await bot.send_message(
             user_tg_id,
-            f"❌ *发货遇到问题*\n\n"
+            f"❌ <b>发货遇到问题</b>\n\n"
             f"{product_line}"
-            f"📋 订单号：`#{order_id}`\n"
-            f"原因：{reason}\n\n"
+            f"📋 订单号：<code>#{order_id}</code>\n"
+            f"原因：{html.escape(reason)}\n\n"
             f"款项已到账，请联系客服处理。",
             reply_markup=builder.as_markup() if customer_service else None,
-            parse_mode="Markdown",
+            parse_mode="HTML",
         )
     except Exception as e:
         logger.error("用户失败通知异常: %s", e)
@@ -348,14 +349,15 @@ def _format_delivery_items(items: list) -> str:
             card = item.get("card_no") or item.get("account") or ""
             pwd = item.get("card_pwd") or item.get("password") or ""
             info = item.get("info") or item.get("content") or ""
+            # 卡密等敏感文本全部使用 html.escape 转义，并用 <code> 标签进行等宽渲染
             if card and pwd:
-                lines.append(f"*#{i}*\n账号：`{card}`\n密码：`{pwd}`")
+                lines.append(f"<b>#{i}</b>\n账号：<code>{html.escape(str(card))}</code>\n密码：<code>{html.escape(str(pwd))}</code>")
             elif card:
-                lines.append(f"*#{i}*\n`{card}`")
+                lines.append(f"<b>#{i}</b>\n<code>{html.escape(str(card))}</code>")
             elif info:
-                lines.append(f"*#{i}*\n`{info}`")
+                lines.append(f"<b>#{i}</b>\n<code>{html.escape(str(info))}</code>")
             else:
-                lines.append(f"*#{i}*\n`{item}`")
+                lines.append(f"<b>#{i}</b>\n<code>{html.escape(str(item))}</code>")
         else:
-            lines.append(f"*#{i}*\n`{item}`")
+            lines.append(f"<b>#{i}</b>\n<code>{html.escape(str(item))}</code>")
     return "\n\n".join(lines)
