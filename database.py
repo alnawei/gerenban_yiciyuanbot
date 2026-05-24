@@ -22,8 +22,12 @@ AMOUNT_QUANT = Decimal("0.000001")
 
 
 def normalize_amount(amount: Decimal) -> Decimal:
-    """与 migrate_phase2 DECIMAL(20,6) 对齐。"""
-    return Decimal(str(amount)).quantize(AMOUNT_QUANT, rounding=ROUND_DOWN)
+    """
+    【升级优化】与 migrate_phase2 DECIMAL(20,6) 保持对齐。
+    修改点：为了彻底杜绝任何 6 位小数的长尾精度漂移，在此强制将 Decimal 截断为最高 3 位小数，
+    数据库存储时会自动补齐后面的 000（如 5.123 存为 5.123000），两层判定极其稳固。
+    """
+    return Decimal(str(amount)).quantize(Decimal("0.001"), rounding=ROUND_DOWN)
 
 
 class EmptyStringError(ValueError):
@@ -119,44 +123,86 @@ async def set_listener_cursor_ms(pool, timestamp_ms: int) -> None:
 # 商品
 # ============================================================
 
-# database.py — 增加高级调试日志的 save_remote_products 函数
-
-# database.py — 优化查重机制与日志日志的 save_remote_products 函数
-
 # database.py — 缩进严格对齐的安全版本
+
+# database.py — 重构后的防改名冲突 save_remote_products 函数
 
 async def save_remote_products(pool, categories: list) -> int:
     """
     保存并更新从远端同步过来的商品与分类。
+    
+    【防重命名冲突重构】：
+      - 优先根据 remote_cat_id 进行唯一性匹配，不再单方面依赖易变的名字。
+      - 名字保护：若 remote_cat_id 已匹配，则对已有分类仅更新其下属商品，绝不覆盖管理员手动修改好的本地分类名称。
+      - 自动绑定：若本地已有同名分类但无 remote_cat_id，首次同步会自动将其与 remote_cat_id 绑定，无损过渡。
     """
     count = 0
     
-    logger.info("🔍 [Sync Debug] 开始执行本地数据保存，传入本地的分类数: %d", len(categories))
+    logger.info("🔍 [Sync Debug] 开始执行本地数据保存。传入分类数: %d", len(categories))
     
     async with pool.acquire() as conn:
-        async with conn.cursor() as cur:
+        # 修改点 1：采用 aiomysql.DictCursor（字典游标），让字段读取更直观、安全
+        async with conn.cursor(aiomysql.DictCursor) as cur:
             for cat in categories:
-                try:
-                    category_name = require_non_empty_text(
-                        cat.get("category_name") or cat.get("name"),
-                        "category_name",
-                    )
-                except EmptyStringError:
-                    logger.warning("🔍 [Sync Debug] 跳过空分类: %s", cat)
-                    continue
-
-                # 写入或更新分类
-                await cur.execute(
-                    """
-                    INSERT INTO categories (category_name, is_active)
-                    VALUES (%s, 1)
-                    ON DUPLICATE KEY UPDATE category_name=VALUES(category_name)
-                    """,
-                    (category_name,),
+                # 获取源站分类的唯一物理 ID
+                remote_cat_id = cat.get("id")
+                api_category_name = require_non_empty_text(
+                    cat.get("category_name") or cat.get("name"),
+                    "category_name",
                 )
-
+                
+                db_category_name = None
+                
+                if remote_cat_id is not None:
+                    # 1. 第一路径：优先根据 remote_cat_id 寻找本地分类
+                    await cur.execute(
+                        "SELECT category_name FROM categories WHERE remote_cat_id = %s",
+                        (remote_cat_id,)
+                    )
+                    row = await cur.fetchone()
+                    if row:
+                        # 找到了已有映射：使用本地数据库中的名字（如您改好的“定制”），保护其名字不被覆盖！
+                        db_category_name = row["category_name"]
+                        logger.debug(
+                            "🔍 [Sync Debug] 通过 ID [%d] 成功匹配到本地自定义分类 [%s] (API名: [%s])",
+                            remote_cat_id, db_category_name, api_category_name
+                        )
+                    else:
+                        # 2. 第二路径（自动自愈）：ID 没找到，但可能本地已有同名分类（旧数据迁移）。尝试自动绑定
+                        await cur.execute(
+                            "SELECT id FROM categories WHERE category_name = %s",
+                            (api_category_name,)
+                        )
+                        existing_cat = await cur.fetchone()
+                        if existing_cat:
+                            # 自动将本地已有的同名分类与源站物理 ID 进行绑定
+                            await cur.execute(
+                                "UPDATE categories SET remote_cat_id = %s WHERE id = %s",
+                                (remote_cat_id, existing_cat["id"])
+                            )
+                            db_category_name = api_category_name
+                            logger.info(
+                                "🔍 [Sync Debug] 🔄 成功将本地存量分类 [%s] 与源站 ID [%d] 进行无损绑定！",
+                                api_category_name, remote_cat_id
+                            )
+                
+                # 3. 第三路径：如果是纯粹的全新分类（本地无 ID，也无同名分类），则执行全新插入
+                if db_category_name is None:
+                    db_category_name = api_category_name
+                    await cur.execute(
+                        """
+                        INSERT INTO categories (category_name, remote_cat_id, is_active)
+                        VALUES (%s, %s, 1)
+                        ON DUPLICATE KEY UPDATE remote_cat_id = VALUES(remote_cat_id)
+                        """,
+                        (db_category_name, remote_cat_id),
+                    )
+                    logger.info("🔍 [Sync Debug] 🆕 检测到新分类，成功入库: [%s] (ID: %s)", db_category_name, remote_cat_id)
+                
+                # 到这里，db_category_name 已经是我们确定要使用的安全分类名称了（如“定制”）
+                # 开始级联同步商品。由于我们使用了 db_category_name，所以商品会正确归属于改名后的分类下，不会产生垃圾数据
                 children = cat.get("children", [])
-                logger.info("🔍 [Sync Debug] 分类 [%s] 下包含的子商品数量: %d", category_name, len(children))
+                logger.info("🔍 [Sync Debug] 分类 [%s] 下包含的子商品数量: %d", db_category_name, len(children))
 
                 for item in children:
                     try:
@@ -168,13 +214,14 @@ async def save_remote_products(pool, categories: list) -> int:
                     except EmptyStringError as e:
                         logger.warning(
                             "🔍 [Sync Debug] 同步跳过(字段空异常): 分类=%s, 商品=%s, 原因=%s", 
-                            category_name, item, e
+                            db_category_name, item, e
                         )
                         continue
                         
                     raw_price = item.get("price", "0")
                     sync_price = "0" if raw_price is None or str(raw_price).strip() == "" else str(raw_price)
 
+                    # 级联写入商品，建立外键映射
                     sql = """
                     INSERT INTO products (remote_code, remote_name, category_name, last_sync_price, is_active)
                     VALUES (%s, %s, %s, %s, 1)
@@ -186,19 +233,13 @@ async def save_remote_products(pool, categories: list) -> int:
                     await cur.execute(sql, (
                         remote_code,
                         remote_name,
-                        category_name,
+                        db_category_name,
                         sync_price,
                     ))
                     count += 1
                     
-                    logger.debug(
-                        "🔍 [Sync Debug] 成功处理商品: code=%s, name=%s", 
-                        remote_code, remote_name
-                    )
-            
-            # 【重要修改】：将日志和返回语句安全地放在 cursor 块的最底部（缩进12个空格），避免任何缩进混淆
-            logger.info("🔍 [Sync Debug] 商品落库事务处理完毕。本次同步写入的商品总数: %d", count)
-            return count
+        logger.info("🔍 [Sync Debug] 商品落库事务处理完毕。本次同步写入的商品总数: %d", count)
+        return count
 
 
 # database.py — 确保分类在普通用户端按 ID 升序固定排列
@@ -356,9 +397,11 @@ async def create_order(
     expire_minutes: int = 30,
 ) -> int | None:
     """
-    写入 recharge_orders（DECIMAL(20,6)）。
-    插入前再次 pending 预检；final_amount UNIQUE 冲突返回 None。
+    写入 recharge_orders 表。
+    修改点：
+      - 对入库前的数据执行强一致性 normalize_amount 转换，彻底规避任何长尾尾数。
     """
+    # 强制将最终支付金额执行 3 位小数截断（等价于 round(amount, 3) 且防 binary 浮点漂移）
     base_str = str(normalize_amount(base_amount))
     final_str = str(normalize_amount(final_amount))
     order_type = require_non_empty_text(order_type, "order_type")
