@@ -471,11 +471,6 @@ async def cb_toggle_cat_status(callback: types.CallbackQuery, db_pool):
 
 @dp.callback_query(F.data.startswith("delcat_execute_"), F.from_user.id == ADMIN_ID)
 async def cb_delcat_execute(callback: types.CallbackQuery, db_pool):
-    """
-    管理员：执行物理删除分类及级联商品。
-    修改点：
-      - 执行删除后，返回分类列表时调用新版物理渲染器进行重写恢复。
-    """
     cat_id = int(callback.data.replace("delcat_execute_", ""))
     
     await callback.answer("正在安全执行物理级联删除...", show_alert=False)
@@ -491,18 +486,18 @@ async def cb_delcat_execute(callback: types.CallbackQuery, db_pool):
         async with db_pool.acquire() as conn:
             async with conn.cursor() as cur:
                 await cur.execute("SET FOREIGN_KEY_CHECKS = 0")
+                await cur.execute("START TRANSACTION")  # ⭐️ 显式开启事务
                 try:
                     await cur.execute("DELETE FROM products WHERE category_name = %s", (cat_name,))
                     await cur.execute("DELETE FROM categories WHERE id = %s", (cat_id,))
-                    await conn.commit()
+                    await cur.execute("COMMIT")  # ⭐️ 成功提交
                 except Exception as db_err:
-                    await conn.rollback()
+                    await cur.execute("ROLLBACK")  # ⭐️ 失败回滚
                     raise db_err
                 finally:
                     await cur.execute("SET FOREIGN_KEY_CHECKS = 1")
         
         await callback.answer(f"✅ 分类【{cat_name}】及其商品已被成功物理清除！", show_alert=True)
-        # 物理彻底刷新整页，对齐删除后的列表
         await _render_manage_cats(callback, db_pool, use_reply_markup_only=False)
         
     except Exception as e:
@@ -522,14 +517,6 @@ async def start_rename_cat(callback: types.CallbackQuery, state: FSMContext):
 
 @dp.message(AdminSetup.waiting_for_new_cat_name, F.from_user.id == ADMIN_ID)
 async def process_new_cat_name(message: types.Message, state: FSMContext, db_pool):
-    """
-    【重构修复】管理员：处理输入的新分类名称并落库。
-    
-    修复点：
-      - 弃用原版“先删除、后插入”导致 ID 变大、排序乱跳的逻辑。
-      - 改用原子的 UPDATE 直接修改 categories 表中的名字，使主键 ID 永久保持不变，
-        从而配合 ORDER BY id ASC 实现了改名后分类位置绝对不发生偏移。
-    """
     try:
         new_cat_name = _message_text(message, "分类名称")
     except EmptyStringError:
@@ -543,26 +530,25 @@ async def process_new_cat_name(message: types.Message, state: FSMContext, db_poo
 
     async with db_pool.acquire() as conn:
         async with conn.cursor() as cur:
-            # 临时关闭外键约束，保障多表原子更新的安全性
             await cur.execute("SET FOREIGN_KEY_CHECKS = 0")
+            await cur.execute("START TRANSACTION")  # ⭐️ 显式开启事务
             try:
                 # 1. 同步更新商品表 (products) 中的分类名称冗余关联
                 await cur.execute(
                     "UPDATE products SET category_name=%s WHERE category_name=%s",
                     (new_cat_name, old_cat_name),
                 )
-                # 2. 【核心修复】：直接 UPDATE 分类表中的名称。主键 id 纹丝不动，完美锁住其排序位置
+                # 2. 直接 UPDATE 分类表中的名称
                 await cur.execute(
                     "UPDATE categories SET category_name=%s WHERE category_name=%s",
                     (new_cat_name, old_cat_name),
                 )
-                await conn.commit()
+                await cur.execute("COMMIT")  # ⭐️ 成功后统一提交
             except Exception as e:
-                await conn.rollback()
+                await cur.execute("ROLLBACK")  # ⭐️ 失败后统一回滚
                 logger.error("重命名分类失败，事务已回滚: %s", e)
                 return await message.answer(f"❌ 修改分类名失败：{e}")
             finally:
-                # 必须恢复外键安全检查
                 await cur.execute("SET FOREIGN_KEY_CHECKS = 1")
 
     kb = InlineKeyboardBuilder()
